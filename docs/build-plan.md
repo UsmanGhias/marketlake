@@ -494,7 +494,7 @@ One rule places every test. Apply it in order and stop at the first match.
 1. Slice-1 cycle end to end.
 2. Full simulated session.
 3. Kill and restart mid-day. Slow.
-4. Kill compaction mid-seal. Slow.
+4. Kill compaction mid-seal.
 5. Early-close day.
 6. Overnight death.
 7. Fully dark session.
@@ -506,17 +506,18 @@ One rule places every test. Apply it in order and stop at the first match.
 13. Synthetic split replay.
 14. Restore from backup.
 
-Six of those have no test today. `tests/integration/` holds three files, and the rest of
+Five of those have no test today. `tests/integration/` holds four files, and the rest of
 the roster is served at the component level, which is fine for the ones that need no real
-process to die partway. The six split into two kinds.
+process to die partway. Test 4 is the first test in any tier to kill a running process,
+and the child it kills is `tests/support/compaction_child.py`. The five split into two
+kinds.
 
-Four are buildable now, and each covers a failure the unit and component suites cannot
+Three are buildable now, and each covers a failure the unit and component suites cannot
 reach:
 
-1. 4, kill compaction mid-seal, which is [#98](https://github.com/l3a0/marketlake/issues/98),
-2. 6, overnight death,
-3. 7, fully dark session,
-4. 14, restore from backup.
+1. 6, overnight death,
+2. 7, fully dark session,
+3. 14, restore from backup.
 
 Two are blocked on work that does not exist yet, because their subject is slice 3's:
 
