@@ -738,6 +738,7 @@ DRIFT = report.SchemaDrift(
     missing=("open_interest",),
     unexpected=("gone",),
     retyped=("volume: int64 -> int32",),
+    widened=("bid: int64 -> double",),
     segments=("journal/date=2026-08-24/surface=chains/ticker=SPY/seg-a-1.arrows",),
 )
 AT = _et(DAY, 16, 30, 12)
@@ -749,6 +750,7 @@ def test_the_writer_files_exactly_what_it_was_given(lake_root):
     assert path == report.schema_drift_dir(lake_root, DAY) / "163012000000-chains-SPY-11.json"
     assert path.read_text() == (
         '{"at": "2026-08-24T16:30:12-04:00", '
+        '"carries_pinned": false, '
         '"day": "2026-08-24", '
         '"missing": ["open_interest"], '
         '"partition": "chains/ticker=SPY/date=2026-08-24.parquet", '
@@ -759,7 +761,8 @@ def test_the_writer_files_exactly_what_it_was_given(lake_root):
         '"journal/date=2026-08-24/surface=chains/ticker=SPY/seg-a-1.arrows"], '
         '"surface": "chains", '
         '"ticker": "SPY", '
-        '"unexpected": ["gone"]}\n'
+        '"unexpected": ["gone"], '
+        '"widened": ["bid: int64 -> double"]}\n'
     )
 
 
@@ -1848,10 +1851,12 @@ def test_a_refused_widening_files_no_finding(lake_root, monkeypatch):
 # -- what the repaired partition leaves behind -------------------------------
 
 
-def test_a_widening_past_the_pinned_type_is_filed_as_a_retype(lake_root, monkeypatch):
+def test_a_widening_past_the_pinned_type_is_filed_as_a_retype(lake_root, monkeypatch, capsys):
     # The merged type is the wider of the two, and the pinned schema holds the narrower
-    # one, so the schema check finds the difference and names the column. That report is
-    # what tells a later reader this partition came out of a repair.
+    # one, so the schema check finds the difference and names the column. The record
+    # carries both fields here, and they say different things about the same column.
+    # ``retyped`` is the merged schema against the pinned one, which wants a schema bump.
+    # ``widened`` is the two segments against each other, which a bump does not clear.
     _split_day(
         lake_root,
         morning_type=pa.int64(),
@@ -1865,17 +1870,26 @@ def test_a_widening_past_the_pinned_type_is_filed_as_a_retype(lake_root, monkeyp
 
     (finding,) = _findings(lake_root)
     assert finding["retyped"] == [f"{COLUMN}: int64 -> double"]
+    assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
+    assert finding["carries_pinned"] is False
     assert finding["partition"] == outcome.partition
     assert sorted(finding["segments"]) == sorted(outcome.segments)
+    # A widening does not excuse the bump here. The partition now holds the column wider
+    # than the pinned schema does, so the operator has something left to correct, and the
+    # terminal has to keep saying so rather than reading the widening as the whole story.
+    err = capsys.readouterr().err
+    assert "Correct the schema and bump schema_version." in err
+    assert "An authorized widening" not in err
 
 
-def test_a_widening_onto_the_pinned_type_files_nothing(lake_root, monkeypatch):
-    # The honest limit of that record, held here so it is not discovered by surprise.
-    # When the pinned schema already holds the wider type, the merged schema equals it
-    # and the check has no difference to report. The repair seals a ticker-day whose
-    # segments disagreed and files nothing, so the only trace left is the superseding
-    # manifest entry. Narrowing that gap is
-    # [#193](https://github.com/l3a0/marketlake/issues/193).
+def test_a_widening_onto_the_pinned_type_is_filed_as_a_widening(lake_root, monkeypatch):
+    # The case the merged-against-pinned check cannot see, and the likelier of the two. A
+    # human correcting a mid-day retype pins the type they meant, which is the wider one,
+    # and then repairs the older segments up to it. The merged schema then equals the
+    # pinned one and the three difference fields have nothing to report. ``widened`` is
+    # what survives that, so the partition is still distinguishable from an ordinary seal
+    # by something that names the column and both types rather than by being a second
+    # manifest entry whose ``source`` reads ``compaction`` like every other one.
     _split_day(
         lake_root,
         morning_type=pa.int64(),
@@ -1887,8 +1901,177 @@ def test_a_widening_onto_the_pinned_type_files_nothing(lake_root, monkeypatch):
 
     outcome = _repair(lake_root, allow_retype=True)
 
-    assert _findings(lake_root) == []
+    (finding,) = _findings(lake_root)
+    assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
+    assert finding["missing"] == [] and finding["unexpected"] == [] and finding["retyped"] == []
+    assert finding["refused"] is False
+    assert finding["carries_pinned"] is True
+    assert finding["partition"] == outcome.partition
+    assert sorted(finding["segments"]) == sorted(outcome.segments)
     assert latest_entries(lake_root)[outcome.partition]["rows"] == 2
+
+
+def test_the_widening_record_reaches_the_terminal_and_pages_nobody(lake_root, monkeypatch, capsys):
+    # Whether this record pages is not a policy this code chooses. Widening is reachable
+    # from ``recompact_ticker_day`` alone, which takes no publisher, so a widening finding
+    # has no way to reach a phone and no suppression is needed to keep it off one. Waking
+    # a human for an act they are performing would be noise anyway. What they get instead
+    # is the line on the terminal they are already watching, naming the column and both
+    # types, and the durable file behind it.
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    _repair(lake_root, allow_retype=True)
+
+    err = capsys.readouterr().err
+    assert SCHEMA_DRIFT_TITLE in err
+    assert f"widened {COLUMN}: int64 -> double" in err
+    # The schema bump is the wrong move here, and the body has to say so. The operator
+    # pinned the promoted type before running the repair, so there is nothing to bump.
+    assert "An authorized widening" in err
+    assert "bump schema_version" not in err
+    assert undelivered(lake_root, DAY) == 0
+
+
+def test_an_ordinary_seal_names_no_widening(lake_root, monkeypatch):
+    # The over-reach. A scheduled sweep merges by name alone and never widens anything, so
+    # a drift it does file has to leave ``widened`` empty. A record that named a widening
+    # on every drifted ticker-day would tell a reader a human authorized something on a
+    # night nobody ran a repair.
+    dropped = _without(CHAINS_SCHEMA, COLUMN)
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0))),
+        start_ts="a",
+    )
+    _segment(lake_root, dropped, _table(dropped, _rows(3, snap_ts=_snap(DAY, 1))), start_ts="b")
+    _pin(monkeypatch, dropped)
+
+    _run(lake_root)
+
+    (finding,) = _findings(lake_root)
+    assert finding["unexpected"] == [COLUMN]
+    assert finding["widened"] == []
+
+
+def test_a_clean_seal_still_files_nothing(lake_root, monkeypatch):
+    # The other half of that. The new condition files on ``widened`` as well as on a
+    # schema difference, and a seal with neither still has to write nothing. Compaction
+    # seals hundreds of ticker-days a night, and a file per seal would bury the findings
+    # that mean something under empty ones.
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0))),
+        start_ts="a",
+    )
+
+    result, _ = _run(lake_root)
+
+    assert len(result.sealed) == 1
+    assert _findings(lake_root) == []
+
+
+def test_a_null_column_promoted_under_the_flag_is_not_named_as_widened(lake_root, monkeypatch):
+    # A segment written before a column carried any value holds it at Arrow's null type,
+    # and the scheduled merge promotes that on its own. So it is not a disagreement the
+    # flag authorized, and naming it would point a reader at the wrong column. The same
+    # exclusion ``_type_conflicts`` makes for the same reason.
+    _split_day(
+        lake_root,
+        morning_type=pa.null(),
+        morning_values=[None, None],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    _repair(lake_root, allow_retype=True)
+
+    assert _findings(lake_root) == []
+
+
+def test_every_type_the_segments_held_is_named(lake_root, monkeypatch):
+    # Three segments at three types promote to one, and the record names what each held
+    # rather than the first pair it met. An operator reading the file afterwards is asking
+    # which recordings were merged into one column, and a single pair answers that only
+    # when the day rotated once.
+    morning = _retyped(COLUMN, pa.int32())
+    midday = _retyped(COLUMN, pa.int64())
+    afternoon = _retyped(COLUMN, pa.float64())
+    _segment(lake_root, morning, _table(morning, _rows(1, snap_ts=_snap(DAY, 0))), start_ts="a")
+    _segment(lake_root, midday, _table(midday, _rows(1, snap_ts=_snap(DAY, 1))), start_ts="b")
+    _segment(lake_root, afternoon, _table(afternoon, _rows(1, snap_ts=_snap(DAY, 2))), start_ts="c")
+    _pin(monkeypatch, _retyped(COLUMN, pa.float64()))
+
+    _repair(lake_root, allow_retype=True)
+
+    (finding,) = _findings(lake_root)
+    assert finding["widened"] == [
+        f"{COLUMN}: int32 -> double",
+        f"{COLUMN}: int64 -> double",
+    ]
+
+
+def test_one_pair_is_named_once_however_many_segments_held_it(lake_root, monkeypatch):
+    # A daemon that flapped between two releases all day leaves four segments and two
+    # types, and the pair is the same pair three times over. The page caps how many column
+    # names it prints, so a repeated entry spends that budget on a fact the reader already
+    # has and pushes a real column off the message.
+    narrow = _retyped(COLUMN, pa.int64())
+    wide = _retyped(COLUMN, pa.float64())
+    for index, (schema, stamp) in enumerate(
+        ((narrow, "a"), (wide, "b"), (narrow, "c"), (wide, "d"))
+    ):
+        _segment(
+            lake_root, schema, _table(schema, _rows(1, snap_ts=_snap(DAY, index))), start_ts=stamp
+        )
+    _pin(monkeypatch, wide)
+
+    _repair(lake_root, allow_retype=True)
+
+    (finding,) = _findings(lake_root)
+    assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
+
+
+def test_a_widening_on_a_day_that_also_drifted_by_a_nullability_still_wants_the_bump(
+    lake_root, monkeypatch, capsys
+):
+    # The case that cannot be read off the three difference lists. A nullability change is
+    # a real difference against the pinned schema that names no column, so a finding
+    # carrying it looks exactly like one filed for the widening alone. The two want
+    # opposite things from the operator, and only the recorded schema-equality fact tells
+    # them apart. Inferring it from the three lists being empty would tell an operator
+    # whose pinned schema is genuinely wrong that there is nothing left to correct.
+    wide = _retyped(COLUMN, pa.float64())
+    index = wide.get_field_index("volume")
+    field = wide.field(index)
+    renullable = wide.set(index, field.with_nullable(not field.nullable))
+    _split_day(
+        lake_root,
+        morning_type=pa.int64(),
+        morning_values=[100],
+        afternoon_type=pa.float64(),
+        afternoon_values=[200.5],
+    )
+    _pin(monkeypatch, renullable)
+
+    _repair(lake_root, allow_retype=True)
+
+    (finding,) = _findings(lake_root)
+    assert finding["widened"] == [f"{COLUMN}: int64 -> double"]
+    assert (finding["missing"], finding["unexpected"], finding["retyped"]) == ([], [], [])
+    assert finding["carries_pinned"] is False, "the schemas differ, by a nullability alone"
+    err = capsys.readouterr().err
+    assert "Correct the schema and bump schema_version." in err
+    assert "An authorized widening" not in err
 
 
 # -- the flag reaches the repair from the command line -----------------------
