@@ -29,6 +29,11 @@ These cover the check's contract:
 7. The writer itself: where the file lands, what it holds, and that it never overwrites.
 8. One page per run carries the finding to a phone, naming every column that moved, and
    an ordinary run sends none.
+9. A merge the segments' own types refused files its own finding, flagged so a reader can
+   tell it from a sealed one, and reaches the same single page. It folds with a drift that
+   survived the merge, it files again on every run the conflict survives, it still pages
+   when the file cannot be written, and the human-invoked repair lets it out rather than
+   containing it.
 """
 
 from __future__ import annotations
@@ -530,8 +535,9 @@ def test_two_drifted_ticker_days_each_file_their_own(lake_root, monkeypatch):
 
 
 def test_the_sweep_finishes_past_a_drifted_ticker_day(lake_root, monkeypatch):
-    # ``compact`` seals every ticker-day bare and its only try/except wraps the ping, so
-    # a raise here would cost the rest of the sweep, the backup, and the ping.
+    # The sweep catches one name out of ``_seal``, the merge a column type conflict
+    # refused, and nothing else. So a raise here would cost the rest of the sweep, the
+    # backup, and the ping.
     dropped = _without(CHAINS_SCHEMA, COLUMN)
     _segment(
         lake_root,
@@ -737,6 +743,7 @@ def test_the_writer_files_exactly_what_it_was_given(lake_root):
         '"day": "2026-08-24", '
         '"missing": ["open_interest"], '
         '"partition": "chains/ticker=SPY/date=2026-08-24.parquet", '
+        '"refused": false, '
         '"retyped": ["volume: int64 -> int32"], '
         '"schema_version": 1, '
         '"segments": ['
@@ -1193,3 +1200,243 @@ def test_main_builds_the_publisher_that_pages(lake_root, monkeypatch, tmp_path):
 
     leaked = Message(event="probe", title="t", body=f"the key is {PING_KEY}")
     assert publisher.publish(leaked, now=_et(DAY, 16, 30)).reason == "refused"
+
+
+# -- 9. a merge the segment types refused ------------------------------------
+
+
+def _conflicted_day(lake_root: Path, ticker: str = "SPY", day: date = DAY) -> tuple[Path, Path]:
+    """One ticker-day whose two segments hold ``COLUMN`` at different types.
+
+    This is the drift the merge never lets the pinned-schema comparison see.
+    ``pa.concat_tables`` refuses it outright, so the ticker-day has no merged schema and
+    no partition, and the finding has to come from the refusal itself.
+    """
+    index = CHAINS_SCHEMA.get_field_index(COLUMN)
+    retyped = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.float64()))
+    morning = _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(day, 0), ticker=ticker)),
+        start_ts="a",
+        ticker=ticker,
+        day=day,
+    )
+    afternoon = _segment(
+        lake_root,
+        retyped,
+        _table(retyped, _rows(3, snap_ts=_snap(day, 1), ticker=ticker)),
+        start_ts="b",
+        ticker=ticker,
+        day=day,
+    )
+    return morning, afternoon
+
+
+def test_a_refused_merge_files_a_finding_naming_both_types(lake_root):
+    # The refusal commits no seal, so ``_seal``'s own filing, which waits for the manifest
+    # append, can never reach it. The sweep files this one instead. ``SchemaDrift`` already
+    # carries what it has to say: the column and both its types under ``retyped``, the
+    # segments still on disk, and the Parquet path that was not written.
+    morning, afternoon = _conflicted_day(lake_root)
+
+    result, _ = _run(lake_root)
+
+    (finding,) = _findings(lake_root)
+    assert finding["retyped"] == [f"{COLUMN}: int64 -> double"]
+    assert finding["missing"] == [] and finding["unexpected"] == []
+    assert finding["surface"] == "chains" and finding["ticker"] == "SPY"
+    # The discriminator. ``retyped`` renders ``pinned -> merged`` on a sealed finding and
+    # ``earlier -> later`` on this one, and the two need opposite responses. Without this
+    # flag a reader holding one file would have to go and check whether the partition
+    # exists to tell which kind it has.
+    assert finding["refused"] is True
+    assert finding["schema_version"] == journal.SCHEMA_VERSION
+    assert finding["partition"] == result.refused[0].partition
+    assert finding["segments"] == [
+        str(morning.relative_to(lake_root)),
+        str(afternoon.relative_to(lake_root)),
+    ]
+    # The finding names a Parquet that is not there, which is the point of naming it.
+    assert not (lake_root / finding["partition"]).exists()
+
+
+def test_an_all_null_segment_is_not_named_as_the_conflicting_column(lake_root):
+    # ``promote_options="default"`` resolves a null-typed column against any type, so a
+    # segment whose column was all nulls never causes the refusal. Counting it would name
+    # the wrong pair of types and point the reader at the wrong segment. Three segments:
+    # the column all-null in the first, int in the second, float in the third. The refusal
+    # is between the second and the third, and only those two types belong in the finding.
+    index = CHAINS_SCHEMA.get_field_index(COLUMN)
+    nulled = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.null()))
+    retyped = CHAINS_SCHEMA.set(index, pa.field(COLUMN, pa.float64()))
+    rows = _rows(2, snap_ts=_snap(DAY, 0))
+    for row in rows:
+        row[COLUMN] = None
+    _segment(lake_root, nulled, _table(nulled, rows), start_ts="a")
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 1))),
+        start_ts="b",
+    )
+    _segment(lake_root, retyped, _table(retyped, _rows(2, snap_ts=_snap(DAY, 2))), start_ts="c")
+
+    result, _ = _run(lake_root)
+
+    (refused,) = result.refused
+    assert refused.conflicts == (f"{COLUMN}: int64 -> double",)
+    assert len(refused.segments) == 3
+
+
+def test_a_conflict_the_scan_cannot_explain_still_names_arrows_own_message(lake_root):
+    # The scan models the refusals this code anticipates, and Arrow may refuse for one it
+    # does not. The exception has to stay legible then rather than printing an empty list,
+    # because that message is what reaches the operator running the repair by hand.
+    conflict = compact_module.SegmentSchemaConflict(
+        surface="chains",
+        ticker="SPY",
+        day=DAY,
+        partition="chains/ticker=SPY/date=2026-08-24.parquet",
+        segments=("journal/date=2026-08-24/surface=chains/ticker=SPY/seg-a-1.arrows",),
+        conflicts=(),
+        detail="Unable to merge: some shape this scan does not model",
+    )
+
+    assert "some shape this scan does not model" in str(conflict)
+    assert conflict.partition in str(conflict)
+    # The finding it files lists nothing, which ``SchemaDrift`` allows, and still names
+    # the ticker-day to go and look at.
+    drift = compact_module._refused_drift(conflict)
+    assert drift.retyped == () and drift.missing == () and drift.unexpected == ()
+    assert drift.refused is True and drift.ticker == "SPY"
+
+
+def test_a_run_whose_only_drift_is_a_refusal_still_pages(lake_root):
+    # The integration that makes containment safe rather than a regression. Before #188 a
+    # raise was the only thing a retype sent to a human. Catching it without adding the
+    # finding to what the run pages from would trade a nightly page for a file nobody
+    # reads, which is the gap #188 closed. Nothing here drifts past the merge, so this
+    # page exists only because the refusal reached ``_page_drift``.
+    _conflicted_day(lake_root)
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert result.sealed == () and len(result.refused) == 1
+    assert len(transport.messages) == 1
+    page = transport.messages[0]
+    assert page.event == SCHEMA_DRIFT_EVENT
+    assert page.title == SCHEMA_DRIFT_TITLE
+    assert page.priority == 5
+    assert f"{COLUMN}: int64 -> double" in page.body
+    assert DAY.isoformat() in page.body
+    # The remedy has to match the producer. #184 established that correcting the pinned
+    # schema does not touch a disagreement between two segments, so a page prescribing the
+    # bump here would send the reader down a path that changes nothing.
+    assert "refused outright" in page.body
+    assert "schema_version" not in page.body
+    # The page goes out and the backup and the ping still run. The refusal costs neither.
+    assert events == ["backup", "ping"]
+
+
+def test_a_refusal_and_a_surviving_drift_fold_into_one_page(lake_root, monkeypatch):
+    # One bad release drifts every ticker-day still in flight, and which shape each one
+    # takes depends only on which segments it happened to have. So the two paths file
+    # separately and page together, the same fold a wide drift already gets.
+    _conflicted_day(lake_root)
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0), ticker="ZZZ")),
+        start_ts="a",
+        ticker="ZZZ",
+    )
+    # ZZZ merges cleanly and drifts against the pinned schema. SPY never gets that far.
+    _pin(monkeypatch, _without(CHAINS_SCHEMA, COLUMN))
+    publisher, transport = _paging(lake_root)
+
+    result, _ = _run(lake_root, publisher=publisher)
+
+    assert len(result.sealed) == 1 and len(result.refused) == 1
+    assert sorted(finding["ticker"] for finding in _findings(lake_root)) == ["SPY", "ZZZ"]
+    assert len(transport.messages) == 1
+    body = transport.messages[0].body
+    assert body.startswith("2 ticker-day(s)")
+    assert f"{COLUMN}: int64 -> double" in body
+    assert f"unexpected {COLUMN}" in body
+    # A folded page must say which half each remedy applies to. One sealed and wants the
+    # schema bump, one was refused and does not.
+    assert "1 sealed, so correct the schema and bump schema_version" in body
+    assert "1 was refused outright" in body
+
+
+def test_a_refused_ticker_day_is_filed_again_on_every_run(lake_root):
+    # The cadence. A sealed ticker-day files once and its manifest entry is what makes the
+    # later silence readable. A refused one has no entry, so a writer that filed once would
+    # make night two's silence consistent with three worlds at once: fixed, still broken
+    # and already filed, or gone. De-duplication is the reader's policy, and a reader
+    # cannot undo a record that was never written.
+    _conflicted_day(lake_root)
+    publisher, transport = _paging(lake_root)
+
+    # Two nights, at different times of day. The finding's file name is a time-of-day
+    # stamp, a surface, a ticker, and a pid, with no date in it, and the directory above
+    # it is keyed on the session day rather than the night. So two runs at the same
+    # microsecond-of-day over one drifted session day write the same name, and the second
+    # is swallowed. A real clock makes that a one-in-billions coincidence, and #191 is
+    # where the structural version of it lives. Moving the second run's clock keeps this
+    # test on the cadence rather than on the file name.
+    _run(lake_root, publisher=publisher)
+    _run(lake_root, clock=ManualClock(_et(TUESDAY, 16, 31)), publisher=publisher)
+
+    # Both land under the session day they are about, which is the day that drifted and
+    # not the night that found it.
+    assert len(_findings(lake_root)) == 2
+    assert len(transport.messages) == 2
+
+
+def test_a_refusal_that_cannot_be_filed_still_pages_and_still_seals(lake_root, monkeypatch):
+    # ``_file_drift`` swallows a write that fails, and the refusal path goes through it for
+    # that reason. A full disk must not turn one refused ticker-day back into a lost run.
+    # The page goes out anyway, because the finding is remembered before the write is tried.
+    _conflicted_day(lake_root)
+    _segment(
+        lake_root,
+        CHAINS_SCHEMA,
+        _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0), ticker="ZZZ")),
+        start_ts="a",
+        ticker="ZZZ",
+    )
+
+    def boom(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(compact_module, "write_schema_drift", boom)
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert len(result.refused) == 1 and len(result.sealed) == 1
+    assert _findings(lake_root) == []
+    assert len(transport.messages) == 1
+    assert events == ["backup", "ping"]
+
+
+def test_the_repair_lets_a_refused_merge_out(lake_root):
+    # The scheduled sweep contains the refusal because a raise there costs every other
+    # ticker-day, the backup, and the ping. A hand-run repair has no other ticker-day to
+    # protect, so the operator gets the failure named on their own terminal instead of a
+    # silent no-op. It cannot clear the conflict either: it reaches the same merge.
+    morning, afternoon = _conflicted_day(lake_root)
+    morning_before = morning.read_bytes()
+
+    with pytest.raises(compact_module.SegmentSchemaConflict) as raised:
+        recompact_ticker_day(lake_root, "chains", "SPY", DAY, clock=ManualClock(_et(DAY, 17, 0)))
+
+    conflict = raised.value
+    assert conflict.conflicts == (f"{COLUMN}: int64 -> double",)
+    assert conflict.ticker == "SPY" and conflict.day == DAY
+    assert f"{COLUMN}: int64 -> double" in str(conflict)
+    assert morning.read_bytes() == morning_before and afternoon.exists()
+    assert read_manifest(lake_root) == []
