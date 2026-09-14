@@ -326,6 +326,243 @@ def test_now_reports_the_last_data_cycle_and_minutes_since(service: DashboardSer
     assert spy_quotes["last_status"] == "captured"
 
 
+def test_a_row_reads_stale_against_the_last_minute_a_cycle_was_owed(root: Path):
+    """The evening is when the day gets reviewed, and it used to be when the reading died.
+
+    Painting a row stale against ``now`` outside the capture window would light every row
+    every evening, because the age climbs on its own once the session ends. The old code
+    avoided that by painting nothing at all after the option close, so a session that
+    captured nothing read as plain text in exactly those hours. The verdict now reads
+    against the last option close that has passed, which both readings get right.
+    """
+    # QQQ's newest data cycle is Friday's option close, and Monday is gap-only. Read at
+    # Monday 17:00 the day is over, so Monday's close is the minute a cycle was owed by.
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    qqq = next(row for row in evening["surfaces"] if row["ticker"] == "QQQ")
+
+    assert evening["phase"] == "closed"
+    assert evening["capture_owed_through"] == et(MONDAY, 16, 15).isoformat()
+    assert qqq["stale"] is True
+
+
+def test_a_healthy_ticker_reads_clean_all_evening(fixture_lake: FixtureLake):
+    """A ticker that captured through its own close is not late, however the age climbs.
+
+    This is the reading the old gate protected and the one a naive threshold would break.
+    The age at 17:00 is 45 minutes against a threshold of 3, so only the reference instant
+    keeps the row clean.
+    """
+    root = one_segment_lake(fixture_lake, [_chains("SPY", et(MONDAY, 16, 15))])
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    spy = next(row for row in evening["surfaces"] if row["surface"] == "chains")
+
+    assert spy["minutes_since"] == 45.0  # far past the 3-minute threshold
+    assert spy["stale"] is False
+
+
+def test_a_lake_with_no_closed_session_behind_it_paints_nothing_stale(root: Path):
+    """Nothing has been owed yet, so nothing can be late yet.
+
+    The fixture calendar's first session is the Thursday. Read before it, the walk finds
+    no option close that has passed, and a row with no data is then a lake waiting for
+    its first session rather than a capture failure.
+    """
+    before_any = service_over(root, now=et(date(2026, 8, 19), 12, 0)).run_query("now", {})
+
+    assert before_any["capture_owed_through"] is None
+    assert [row["stale"] for row in before_any["surfaces"]] == [False, False, False]
+
+
+def test_a_ticker_registered_before_the_owed_minute_is_still_judged(root: Path):
+    """The late-onboard guard must exempt a late epoch, never every epoch.
+
+    Dropping the comparison and exempting any ticker that carries a ``capture_start`` at
+    all reads green against a suite whose stale rows all have none. In production every
+    ticker has one, so that simplification switches the column off altogether.
+    """
+    write_master(root, "QQQ", et(MONDAY, 9, 0))
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    qqq = next(row for row in evening["surfaces"] if row["ticker"] == "QQQ")
+
+    assert qqq["capture_start"] == et(MONDAY, 9, 0).isoformat()
+    assert qqq["stale"] is True
+
+
+def test_a_ticker_registered_exactly_at_the_owed_minute_is_judged(root: Path):
+    """An epoch on the owed minute was owed that cycle, so it is not exempt."""
+    write_master(root, "QQQ", et(MONDAY, 16, 15))
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    qqq = next(row for row in evening["surfaces"] if row["ticker"] == "QQQ")
+
+    assert qqq["capture_start"] == evening["capture_owed_through"]
+    assert qqq["stale"] is True
+
+
+def test_a_retired_ticker_is_never_late(root: Path):
+    """Nothing is owed of a ticker whose capture span has closed.
+
+    The Today strip marks every post-retirement slot out of scope, so a verdict here that
+    ignored scope would contradict the strip one panel over. The page happens to test
+    scope before staleness, which hid the wrong value rather than fixing it.
+    """
+    write_closed_span(root, "SPY", et(MONDAY, 9, 30), et(MONDAY, 12, 0))
+
+    evening = service_over(root, now=et(MONDAY, 17, 0)).run_query("now", {})
+    spy = [row for row in evening["surfaces"] if row["ticker"] == "SPY"]
+
+    assert [row["in_scope"] for row in spy] == [False, False]
+    assert [row["stale"] for row in spy] == [False, False]
+
+
+def test_a_recent_cycle_inside_the_threshold_is_not_late(root: Path):
+    """A small positive gap is the case a zero threshold would paint stale."""
+    # SPY quotes' newest data cycle is 09:31, one minute before this instant.
+    payload = service_over(root, now=et(MONDAY, 9, 32)).run_query("now", {})
+    quotes = next(row for row in payload["surfaces"] if row["surface"] == "quotes")
+
+    assert quotes["minutes_since"] == 1.0
+    assert quotes["stale"] is False
+
+
+def test_the_injected_guard_decides_the_verdict_and_not_only_the_label(root: Path):
+    """The page reports the threshold and colours by it, so one guard must drive both.
+
+    Asserting only that ``stale_after_minutes`` carries the injected number leaves the
+    verdict free to use a hardcoded one, and the panel would then report a threshold it
+    does not colour by.
+    """
+    tightened = GuardConstants(watchdog_page_minutes=0)
+    at = et(MONDAY, 9, 32)
+
+    loose = service_over(root, now=at).run_query("now", {})
+    tight = service_over(root, guards=tightened, now=at).run_query("now", {})
+
+    def quotes(payload):
+        return next(row for row in payload["surfaces"] if row["surface"] == "quotes")
+
+    assert quotes(loose)["stale"] is False
+    assert tight["stale_after_minutes"] == 0
+    assert quotes(tight)["stale"] is True
+
+
+def test_a_cycle_exactly_at_the_threshold_has_not_passed_it(root: Path):
+    """A row is late *past* the threshold, so the threshold itself is still inside it."""
+    # SPY quotes' newest data cycle is 09:31, exactly three minutes before this instant.
+    at_threshold = service_over(root, now=et(MONDAY, 9, 34)).run_query("now", {})
+    past_it = service_over(root, now=et(MONDAY, 9, 34, 6)).run_query("now", {})
+
+    def quotes(payload):
+        return next(row for row in payload["surfaces"] if row["surface"] == "quotes")
+
+    assert at_threshold["stale_after_minutes"] == 3
+    assert quotes(at_threshold)["minutes_since"] == 3.0
+    assert quotes(at_threshold)["stale"] is False
+    assert quotes(past_it)["stale"] is True
+
+
+def test_a_recent_gap_does_not_stand_in_for_a_data_cycle(root: Path):
+    """Stale means no durable *data* cycle, and a gap row is not one.
+
+    QQQ's newest slot on the fixture's Monday is a gap two minutes old, while its newest
+    data cycle is the previous Friday. Reading the latest slot of any kind here would
+    call that clean, which is a daemon writing markers every minute while capturing
+    nothing.
+    """
+    payload = service_over(root, now=et(MONDAY, 9, 32)).run_query("now", {})
+    qqq = next(row for row in payload["surfaces"] if row["ticker"] == "QQQ")
+
+    assert qqq["last_snap_ts"] == et(MONDAY, 9, 30).isoformat()
+    assert qqq["last_status"] == "gap"
+    assert qqq["last_data_snap_ts"] == et(FRIDAY, 16, 15).isoformat()
+    assert qqq["stale"] is True
+
+
+def test_the_post_equity_close_quarter_hour_reads_against_now(root: Path):
+    """The capture window runs to the option close, not to the equity close.
+
+    Narrowing the check to the open phase alone drops 16:00 through 16:15, the quarter
+    hour the option close itself lives in, and sends the reading three days back.
+    """
+    payload = service_over(root, now=et(MONDAY, 16, 5)).run_query("now", {})
+
+    assert payload["phase"] == "post_equity_close"
+    assert payload["capture_owed_through"] == et(MONDAY, 16, 5).isoformat()
+
+
+def test_the_owed_minute_walks_back_over_a_weekend(root: Path):
+    """A Sunday reads against Friday's close, because no session has closed since."""
+    sunday = service_over(root, now=et(date(2026, 8, 23), 12, 0)).run_query("now", {})
+
+    assert sunday["phase"] == "non_session"
+    assert sunday["capture_owed_through"] == et(FRIDAY, 16, 15).isoformat()
+
+
+def test_the_walk_reaches_back_over_a_holiday_against_a_weekend(root: Path):
+    """The longest reach the calendar can ask for, which is what sizes the walk's bound.
+
+    A Friday holiday against a weekend, read on the Monday before the open. The walk
+    spends an iteration on Monday, whose own close is still ahead, then Sunday, Saturday
+    and the holiday, and lands on Thursday as the fifth. A bound of four stops one day
+    short and reports that nothing has ever been owed.
+    """
+    holiday_week = FakeCalendar(
+        {
+            THURSDAY: SessionTimes(open=et(THURSDAY, 9, 30), close=et(THURSDAY, 16, 0)),
+            MONDAY: SessionTimes(open=et(MONDAY, 9, 30), close=et(MONDAY, 16, 0)),
+        }
+    )
+    service = DashboardService(
+        root,
+        clock=ManualClock(et(MONDAY, 9, 0).astimezone(UTC)),
+        calendar=holiday_week,
+        page=b"<!doctype html>",
+        icon=b"",
+    )
+
+    payload = service.run_query("now", {})
+
+    assert payload["phase"] == "pre_open"
+    assert payload["capture_owed_through"] == et(THURSDAY, 16, 15).isoformat()
+
+
+def test_a_pre_open_morning_reads_against_the_previous_close(root: Path):
+    """Today's close has not happened yet, so it cannot be the minute anything is owed by."""
+    morning = service_over(root, now=et(MONDAY, 9, 0)).run_query("now", {})
+
+    assert morning["phase"] == "pre_open"
+    assert morning["capture_owed_through"] == et(FRIDAY, 16, 15).isoformat()
+
+
+def test_inside_the_capture_window_the_owed_minute_is_now(root: Path):
+    """The reading inside the session is unchanged, and that is the point."""
+    now = service_over(root).run_query("now", {})
+
+    assert now["phase"] == "open"
+    assert now["capture_owed_through"] == NOW.isoformat()
+
+
+def test_a_ticker_onboarded_after_the_close_is_not_late_that_evening(root: Path):
+    """Nothing was owed of a ticker whose epoch falls after the last owed minute.
+
+    Without this guard a ticker registered at 17:00 reads stale at 17:30, on a lake that
+    has done nothing wrong and owed it nothing yet. The in-scope clamp does not cover
+    this, because the clock has passed the epoch and the ticker really is in scope now.
+    """
+    write_master(root, "SPY", et(MONDAY, 17, 0))
+
+    evening = service_over(root, now=et(MONDAY, 17, 30)).run_query("now", {})
+    spy = next(
+        row for row in evening["surfaces"] if row["ticker"] == "SPY" and row["surface"] == "chains"
+    )
+
+    assert spy["in_scope"] is True
+    assert spy["capture_start"] == et(MONDAY, 17, 0).isoformat()
+    assert spy["stale"] is False
+
+
 def test_now_walks_back_past_a_gap_only_day(service: DashboardService):
     now = service.run_query("now", {})
     qqq = next(row for row in now["surfaces"] if row["ticker"] == "QQQ")
@@ -384,6 +621,203 @@ def test_now_reports_the_dead_man_ping_the_daemon_recorded(root: Path):
 
     now = service_over(root).run_query("now", {})
     assert now["dead_man_last_ping"] == et(MONDAY, 9, 40).isoformat()
+
+
+def test_the_dead_man_ping_carries_its_age_and_the_grace_it_is_judged_against(root: Path):
+    """The line said when the ping fired and nothing else, so a reader subtracted by eye.
+
+    That is what let the panel read healthy through the 2026-09-09 auth outage. The age
+    and the grace ride beside the instant so the page can judge it against the same
+    threshold healthchecks pages after, rather than leaving the reading to the reader.
+    """
+    stamp_ping(root, at=et(MONDAY, 9, 40))
+
+    now = service_over(root).run_query("now", {})
+
+    # NOW is 09:40:30, so the ping is half a minute old and well inside the grace.
+    assert now["dead_man_age_minutes"] == 0.5
+    assert now["dead_man_grace_minutes"] == 5
+
+
+def test_a_recalibrated_grace_reaches_the_panel(root: Path):
+    """The page must not carry its own copy of a constant slice 1 recalibrates."""
+    guards = GuardConstants(dead_man_grace_minutes=9)
+
+    now = service_over(root, guards=guards).run_query("now", {})
+
+    assert now["dead_man_grace_minutes"] == 9
+    # An int, not a float. Both compare equal to 9, and only one of them renders as
+    # "the grace of 9 minutes" rather than "the grace of 9.0 minutes" on the page.
+    assert type(now["dead_man_grace_minutes"]) is int
+
+
+def test_a_recalibrated_grace_moves_the_minute_the_expectation_arms(root: Path):
+    """The grace must reach the arming and not only the sentence that prints it.
+
+    The wake is at 08:25 and the expectation arms one grace after it, so a recalibrated
+    grace moves that minute. Probing only at the pinned default of 5 would pass against
+    a hardcoded 5 in the arming, which is the simplification a reader is most likely to
+    make of the wake-plus-grace reasoning.
+    """
+    guards = GuardConstants(dead_man_grace_minutes=9)
+
+    before = service_over(root, guards=guards, now=et(MONDAY, 8, 33)).run_query("now", {})
+    after = service_over(root, guards=guards, now=et(MONDAY, 8, 34)).run_query("now", {})
+
+    assert before["dead_man_expected"] is False
+    assert after["dead_man_expected"] is True
+
+
+def test_an_unrecorded_ping_has_no_age_rather_than_a_zero(root: Path):
+    """A zero would read as "fired this instant", which is the opposite of the truth."""
+    now = service_over(root).run_query("now", {})
+
+    assert now["dead_man_last_ping"] is None
+    assert now["dead_man_age_minutes"] is None
+
+
+def test_a_ping_is_owed_inside_the_weekday_envelope(root: Path):
+    """Inside the envelope a silent ping is a failure, so the panel may judge it."""
+    assert service_over(root).run_query("now", {})["dead_man_expected"] is True
+
+
+def test_no_ping_is_owed_when_nothing_is_meant_to_be_pinging(root: Path):
+    """Nothing pings outside the envelope, by design, so nothing there is a failure.
+
+    A threshold that ran around the clock would light the line every night and every
+    weekend. A line that is loud every night is one the reader learns to skip, which is
+    the failure the threshold exists to fix.
+    """
+    overnight = et(MONDAY, 2, 0)
+    saturday = et(SATURDAY, 12, 0)
+    sunday_canary = et(date(2026, 8, 23), 21, 0)
+
+    for instant in (overnight, saturday, sunday_canary):
+        payload = service_over(root, now=instant).run_query("now", {})
+        assert payload["dead_man_expected"] is False, instant
+
+
+def test_the_wake_is_not_owed_a_ping_until_the_grace_has_run(root: Path):
+    """The envelope opens at the firmware wake, and the first heartbeat lands after it.
+
+    So the instant the envelope opens, the newest ping is the previous evening's. Owing
+    a ping from that instant would go loud every morning on a daemon that is starting
+    exactly as designed. The expectation arms one grace later, which is the minute
+    healthchecks itself starts expecting a ping.
+    """
+    before = service_over(root, now=et(MONDAY, 8, 29)).run_query("now", {})
+    after = service_over(root, now=et(MONDAY, 8, 30)).run_query("now", {})
+
+    assert before["dead_man_expected"] is False
+    assert after["dead_man_expected"] is True
+
+
+def test_the_expectation_closes_with_the_envelope(root: Path):
+    """The sweep's ping ends the weekday window, and the evening owes nothing after it."""
+    inside = service_over(root, now=et(MONDAY, 18, 44)).run_query("now", {})
+    past = service_over(root, now=et(MONDAY, 18, 45)).run_query("now", {})
+
+    assert inside["dead_man_expected"] is True
+    assert past["dead_man_expected"] is False
+
+
+def test_the_stamp_keeps_landing_while_the_ping_starves(root: Path):
+    """The two lines say different things, and a dead session is where they part.
+
+    Through the 2026-09-09 auth outage every cycle failed and wrote a gap. The loop kept
+    stamping, because the stamp rides the end of every cycle whether or not it produced
+    rows, so the stamp age read zero and alarmed at nothing. The dead-man ping starved,
+    because inside the capture window only a durable data cycle feeds it. The panel needs
+    both to tell a running loop from working capture.
+    """
+    # The last ping is the pre-open heartbeat. The idle heartbeat stands down once the
+    # capture window opens, so nothing has fed the check since.
+    stamp_ping(root, at=et(MONDAY, 9, 29))
+    stamp_cycle(root, at=et(MONDAY, 9, 40), token_minted_at=MINTED, roster=_roster())
+
+    now = service_over(root).run_query("now", {})
+
+    assert now["stamp_age_minutes"] == 0.5
+    assert now["dead_man_age_minutes"] == 11.5
+    assert now["dead_man_expected"] is True
+    assert now["dead_man_starved"] is True
+
+
+def test_a_ping_exactly_at_the_grace_has_not_passed_it(root: Path):
+    """The check is starving *past* the grace, so the grace itself is still inside it.
+
+    healthchecks goes down once the grace has elapsed, not as it elapses. A test here
+    keeps the comparison strict, because loosening it to ``>=`` changes nothing a reader
+    would notice and moves the line one minute early on every reading.
+    """
+    # NOW is 09:40:30, so these pings are exactly 5.0 and 5.1 minutes old.
+    stamp_ping(root, at=et(MONDAY, 9, 35, 30))
+    assert service_over(root).run_query("now", {})["dead_man_starved"] is False
+
+    stamp_ping(root, at=et(MONDAY, 9, 35, 24))
+    assert service_over(root).run_query("now", {})["dead_man_starved"] is True
+
+
+def test_a_check_that_starved_while_owed_stays_loud_after_the_window_shuts(root: Path):
+    """A starved check does not stop being starved when the expectation window closes.
+
+    A ping URL that breaks at 17:00 pages healthchecks by 17:06 and stays down. Judging
+    the ping only against the current minute would drop the page's alarm at 18:45 and
+    leave it down until 08:30 the next weekday, weekends included. That is most of the
+    week, and it is the same false-healthy reading one hour later.
+    """
+    stamp_ping(root, at=et(MONDAY, 17, 0))
+
+    evening = service_over(root, now=et(MONDAY, 18, 59)).run_query("now", {})
+    next_morning = service_over(root, now=et(MONDAY + timedelta(days=1), 7, 0)).run_query("now", {})
+
+    # Nothing is owed at either instant, and the check is down at both.
+    assert evening["dead_man_expected"] is False
+    assert evening["dead_man_starved"] is True
+    assert next_morning["dead_man_expected"] is False
+    assert next_morning["dead_man_starved"] is True
+
+
+def test_a_healthy_day_leaves_the_night_and_the_weekend_quiet(root: Path):
+    """The night must stay quiet, or the reader learns to skip the line.
+
+    The daemon's last heartbeat lands in the envelope's final minute, and the ping then
+    ages all night against a check that expects nothing. Judging it against the last
+    minute one was owed is what keeps a healthy Friday evening from alarming until
+    Monday.
+    """
+    # 18:44 is the last minute inside the weekday envelope, which ends at 18:45.
+    stamp_ping(root, at=et(FRIDAY, 18, 44))
+
+    for instant in (
+        et(FRIDAY, 23, 0),
+        et(SATURDAY, 12, 0),
+        et(MONDAY, 8, 29),
+    ):
+        payload = service_over(root, now=instant).run_query("now", {})
+        assert payload["dead_man_starved"] is False, instant
+
+
+def test_a_daemon_that_died_before_the_close_is_loud_all_weekend(root: Path):
+    """The weekend's quiet is earned by a fed check, never given by the calendar."""
+    stamp_ping(root, at=et(FRIDAY, 12, 0))
+
+    for instant in (et(SATURDAY, 12, 0), et(MONDAY, 8, 29)):
+        payload = service_over(root, now=instant).run_query("now", {})
+        assert payload["dead_man_starved"] is True, instant
+
+
+def test_a_lake_nothing_has_run_against_owes_nothing_at_the_weekend(root: Path):
+    """healthchecks holds a never-pinged check *new* rather than down, and so does this.
+
+    A ping that has never landed is a failure only while one is owed. Reading a never-run
+    lake as a starving check every weekend would be the noise this line exists to avoid.
+    """
+    weekend = service_over(root, now=et(SATURDAY, 12, 0)).run_query("now", {})
+    session = service_over(root).run_query("now", {})
+
+    assert weekend["dead_man_starved"] is False
+    assert session["dead_man_starved"] is True
 
 
 def test_now_counts_the_pages_that_never_reached_the_phone(root: Path):
@@ -878,6 +1312,9 @@ def test_a_ticker_with_no_data_cycle_ever_reports_null_freshness(fixture_lake: F
     assert row["last_status"] == "gap"
     assert row["last_error_class"] == ["http_429"]
     assert row["lookback_exhausted"] is False
+    # A null age is not a clean row. Nothing has ever captured while a cycle was owed,
+    # which is the worst reading the column has, so it is the one that must be loud.
+    assert row["stale"] is True
 
 
 # -- the roster and the lake's shape -----------------------------------------

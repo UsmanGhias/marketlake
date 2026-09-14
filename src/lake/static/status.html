@@ -389,16 +389,42 @@
 
   // A ticker whose capture_start is still ahead of the clock has no minutes-since to be
   // late by. It is not onboarded yet, so it is never painted stale.
+  //
+  // The verdict is the payload's, in row.stale. The number in the cell is the age
+  // against now, which is what a reader wants to see, and the verdict is against the
+  // last minute a cycle was owed, which is the only minute that age means anything
+  // against. The two part company the moment the session ends: a healthy ticker's age
+  // climbs all evening while its verdict stays clean, and a ticker that captured
+  // nothing all day stays stale from the option close onward rather than falling back
+  // to plain text in the hours the day gets reviewed in.
   function minutesSinceCell(now, row) {
     var text = row.minutes_since === null ? DASH : row.minutes_since.toFixed(1);
     var cell = el("td", text, "num");
     if (row.in_scope === false) {
       cell.className = "num muted";
-    } else if (capturing(now) &&
-        (row.minutes_since === null || row.minutes_since > now.stale_after_minutes)) {
+    } else if (row.stale) {
       cell.className = "num stale";
+      cell.title = staleTitle(now);
     }
     return cell;
+  }
+
+  // The threshold is worth saying out loud, because the reading changes with the hour
+  // and a bare red cell cannot say which reading it is.
+  function staleTitle(now) {
+    if (capturing(now)) {
+      return "No durable data cycle in the last " +
+        plural(now.stale_after_minutes, "minute", "minutes") +
+        ", the threshold the watchdog pages at.";
+    }
+    if (now.capture_owed_through === null) {
+      return "No session has closed yet, so there is no minute to read this against.";
+    }
+    return "No durable data cycle in the " +
+      plural(now.stale_after_minutes, "minute", "minutes") + " before " +
+      fmt(now.capture_owed_through, stampFmt) + " ET, the last minute a cycle was owed. " +
+      "The session is over, so the age keeps climbing on its own and the same threshold " +
+      "reads against that minute rather than against now.";
   }
 
   function reasonCell(row) {
@@ -439,16 +465,69 @@
     return "Sunday re-mint in " + plural(minutes, "minute", "minutes") + ".";
   }
 
-  // Six payload fields describe the daemon rather than a ticker. They render as five
-  // lines, since token_age_minutes shares a line with token_minted_at. A null means
-  // nothing has been stamped yet, so the line says that rather than showing a zero. The
-  // page count is the one that is never null, because a day with no file written is a
-  // true zero. Its null branch is a guard, not an expected state.
+  // The dead-man line's verdict is the payload's, in dead_man_starved. The page could
+  // compare the age to the grace itself, and that comparison would be wrong twice over.
+  // Nothing pings outside the daemon's weekday envelope, by design, so judging every
+  // minute would go loud every night and every weekend, and a line that is loud every
+  // night is one the reader learns to skip. Judging only the minutes inside the envelope
+  // fails the other way: a check that starved at 17:00 stays starved, and the line would
+  // fall quiet at 18:45 while healthchecks stayed down. Both readings need the envelope,
+  // which is the control plane's window, so the answer comes from the server rather than
+  // from a second copy of that window here.
   //
-  // The stamp age comes last and reads on every other line above it. The daemon stamps
+  // dead_man_expected is the narrower question, whether a ping is owed this minute. The
+  // line says that in words and never colours by it.
+  //
+  // What feeds the check depends on the hour, so the line says which. Inside the capture
+  // window only a durable data cycle feeds it, because the idle heartbeat stands down
+  // there by design. That is why this line, and not the stamp below it, is what goes
+  // loud when capture is dead. Past the option close the heartbeat resumes, so a fresh
+  // ping there says the daemon is alive and says nothing at all about capture.
+  function deadManText(now) {
+    if (now.dead_man_last_ping === null) {
+      return now.dead_man_starved
+        ? "Dead-man ping: never recorded, and one is owed now."
+        : "Dead-man ping: not recorded yet.";
+    }
+    var fired = "Dead-man ping last fired " + fmt(now.dead_man_last_ping, stampFmt) +
+      " ET, " + plural(now.dead_man_age_minutes, "minute", "minutes") + " ago.";
+    if (now.dead_man_starved) {
+      var past = fired + " That is past the grace of " +
+        plural(now.dead_man_grace_minutes, "minute", "minutes") + ", so the check is ";
+      return now.dead_man_expected
+        ? past + "starving: either no cycle is producing data, or the daemon has stopped."
+        : past + "down, and it went down before the daemon's weekday window closed.";
+    }
+    if (!now.dead_man_expected) {
+      return fired + " The daemon's weekday window is closed, so none is owed.";
+    }
+    if (!capturing(now)) {
+      return fired + " The session is not capturing now, so the idle heartbeat is " +
+        "feeding the check rather than a data cycle.";
+    }
+    return fired;
+  }
+
+  // Ten payload fields describe the daemon rather than a ticker. They render as five
+  // lines, because the token line carries its own age and the dead-man line carries
+  // four values beside its ping. A null instant means nothing has been stamped yet, so
+  // the line says that rather than showing a zero. The page count is never null,
+  // because a day with no file written is a true zero. The grace and the expectation
+  // are never null either, since they come from the clock rather than from the lake.
+  //
+  // The stamp age comes last and reads on the token lines above it. The daemon stamps
   // every minute it is awake, so a stamp older than STALE_STAMP_MINUTES means the writer
-  // stopped and the four values above are what a dead daemon last said. It alarms at
-  // that point for the same reason.
+  // stopped and the mint, the age and the countdown are what a dead daemon last said. It
+  // alarms at that point for the same reason. It does not disclaim the dead-man line,
+  // because a stopped writer stops the ping too, so that line reads a dead daemon
+  // correctly rather than going stale with it. It is the line the operator needs exactly
+  // when the stamp has gone old.
+  //
+  // What the stamp line cannot say is whether capture worked, because the stamp rides
+  // every minute the loop runs and a session of nothing but gaps stamps each of them.
+  // So the line says what it is not, rather than letting a reader take a fresh stamp
+  // for health. It does not point at the dead-man line for the answer, because past the
+  // option close that line is reading the idle heartbeat and cannot give one either.
   function renderDaemon(now) {
     var list = byId("daemon");
     clear(list);
@@ -466,9 +545,8 @@
         className: now.token_sunday_countdown_minutes < 0 ? "alarm" : null
       },
       {
-        text: now.dead_man_last_ping === null
-          ? "Dead-man ping: not recorded yet."
-          : "Dead-man ping last fired " + fmt(now.dead_man_last_ping, stampFmt) + " ET."
+        text: deadManText(now),
+        className: now.dead_man_starved ? "alarm" : null
       },
       {
         text: now.pages_failed_to_send === null
@@ -481,8 +559,11 @@
           ? "Stamp: nothing written yet, so the four lines above are unread."
           : now.stamp_age_minutes > STALE_STAMP_MINUTES
             ? "Stamp is " + plural(now.stamp_age_minutes, "minute", "minutes") +
-              " old, so the lines above are what the daemon last said, not now."
-            : "Stamp written " + plural(now.stamp_age_minutes, "minute", "minutes") + " ago.",
+              " old, so the token lines above are what the daemon last said, not now. " +
+              "The dead-man line judges its own age, so it still holds."
+            : "Stamp written " + plural(now.stamp_age_minutes, "minute", "minutes") +
+              " ago, so the loop is running. The loop stamps every minute whether or " +
+              "not it captured anything, so this line never says capture worked.",
         className: now.stamp_age_minutes === null ||
           now.stamp_age_minutes > STALE_STAMP_MINUTES ? "alarm" : null
       }
