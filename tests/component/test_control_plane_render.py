@@ -57,6 +57,7 @@ EXPECTED_FILES = {
     cp.INSTALL_SCRIPT_FILE,
     cp.UNINSTALL_SCRIPT_FILE,
     cp.RESTART_SCRIPT_FILE,
+    cp.REAUTH_SCRIPT_FILE,
 }
 
 
@@ -869,6 +870,130 @@ def test_render_reports_a_bad_path_on_stderr_and_prints_no_install_text(capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "render: these must be absolute paths" in captured.err
+
+
+# -- the re-auth script --------------------------------------------------------
+
+
+def test_the_install_points_at_the_reauth_script_without_running_it(tmp_path, capsys):
+    """A fresh machine captures nothing until a token exists, so the install says so.
+
+    Both renderings carry the pointer, because they come from one function. Every line
+    of it is a comment: acquiring a token needs a browser and a person, so the install
+    names the step rather than taking it. A pointer that ran would also break ``set -e``
+    on a machine with no browser.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    script = (out / cp.INSTALL_SCRIPT_FILE).read_text()
+    printed = capsys.readouterr().out
+    for text in (script, printed):
+        pointer = [line for line in text.splitlines() if cp.REAUTH_SCRIPT_FILE in line]
+        assert pointer, text
+        assert all(line.startswith("#") for line in pointer), pointer
+    assert cp.CALLBACK_KEY in script
+
+
+def test_the_reauth_script_runs_the_reauth_module_and_nothing_else(tmp_path):
+    """The script is a wrapper. The logic lives in ``lake.reauth``, where tests reach it.
+
+    It also calls no sudo. The token is written as the owner, which the design's
+    Deployment section requires: a token re-created under root would be unreadable by
+    every job that runs as the owner.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    lines = (out / cp.REAUTH_SCRIPT_FILE).read_text().splitlines()
+    # The interpreter is named, not merely present. The execution test below proves a
+    # shebang exists; only this says which one, and the golden alone would report a
+    # swapped interpreter as a stale fixture.
+    assert lines[0] == "#!/bin/bash"
+    commands = [line for line in lines if line and not line.startswith("#")]
+    assert commands == [
+        "set -euo pipefail",
+        "cd /Users/someone/marketlake",
+        'exec /opt/py/bin/python -m lake.reauth "$@"',
+    ]
+    assert not any("sudo" in line for line in commands)
+
+
+def test_the_written_reauth_script_is_executable(tmp_path):
+    """``./reauth.sh`` is the whole interface, so the bit is read off disk.
+
+    The uninstall and restart scripts each have the same test in their own section. The
+    golden cannot stand in for any of them: git stores those fixtures at 0o644.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    assert (out / cp.REAUTH_SCRIPT_FILE).stat().st_mode & 0o777 == 0o755
+
+
+def test_the_reauth_script_says_it_cannot_run_unattended(tmp_path):
+    """The header states it, and says the tool itself is what enforces it.
+
+    Documentation alone would leave the foot-gun in place, so the header has to point at
+    the refusal rather than stand in for it.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    header = (out / cp.REAUTH_SCRIPT_FILE).read_text()
+    assert "Do not add it to a plist." in header
+    assert "refuses when stdin is not a terminal" in header
+
+
+def test_the_reauth_script_bakes_in_no_url(tmp_path):
+    """The renderer reads no config, so no callback and no secret can reach a file.
+
+    ``render_all`` takes a ``LaunchdHost`` and nothing else, so it cannot know the
+    registered callback. The script names the config key and leaves the value to the
+    tool, which is what keeps a rendered directory safe to paste into a bug report.
+    """
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    text = (out / cp.REAUTH_SCRIPT_FILE).read_text()
+    assert "://" not in text
+    assert f"{cp.CALLBACK_KEY}:" not in text
+
+
+def test_the_rendered_reauth_script_runs_and_forwards_its_arguments(tmp_path):
+    """Executed rather than read. The ``cd`` lands, and ``"$@"`` reaches the module.
+
+    The interpreter is a stand-in that records how it was called, so nothing imports
+    ``lake.reauth`` here and no login is attempted. What this exercises is the script
+    itself: its shebang, its executable bit, the working directory it moves to, and the
+    arguments it passes through.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    log = tmp_path / "log"
+    python = tmp_path / "fake-python"
+    python.write_text(f'#!/bin/bash\nprintf \'%s|%s\\n\' "$PWD" "$*" >> {log}\n')
+    python.chmod(0o755)
+
+    out = tmp_path / "out"
+    args = [
+        "--python",
+        str(python),
+        "--owner",
+        "someone",
+        "--home",
+        "/Users/someone",
+        "--project-dir",
+        str(project),
+        "--log-dir",
+        "/Users/someone/Library/Logs/marketlake",
+    ]
+    assert cp.main(["render", "--out", str(out), *args]) == 0
+
+    proc = subprocess.run(
+        [str(out / cp.REAUTH_SCRIPT_FILE), "--config", "/tmp/throwaway.yaml"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert log.read_text().splitlines() == [
+        f"{project}|-m lake.reauth --config /tmp/throwaway.yaml"
+    ]
 
 
 # -- the golden rendering ------------------------------------------------------
