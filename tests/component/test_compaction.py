@@ -21,6 +21,13 @@ They cover the job's contract:
    and leaves an unchanged profile's file untouched.
 8. A sealed partition that re-reads with the wrong row count, in either direction, raises
    before the manifest append, leaving the segments on disk and the backup and ping unrun.
+9. The prune deletes only an empty directory. A ticker directory holding a stray file
+   keeps both, and a repair leaves the date's other ticker-days alone. A repair that
+   empties its date prunes every level of it.
+10. A ticker-day with no segments is passed over, and the rest of its date is still swept.
+    So is every other entry neither sweep recognises: a stray file or a foreign directory
+    at the journal root, under a date, or under a surface, and a date the calendar or the
+    guard rules out. None of them ends the walk it sits in.
 """
 
 from __future__ import annotations
@@ -60,7 +67,7 @@ from lake.manifest import (
     sha256_file,
 )
 from lake.metadata import read_metadata, stamp_cycle
-from lake.paths import LakePaths
+from lake.paths import DATE_PREFIX, SURFACE_PREFIX, LakePaths
 from lake.runner import BackupTargetUnavailable, RsyncBackup
 from lake.tickers import Roster
 from tests.support.backup import FakeBackup
@@ -383,6 +390,43 @@ def test_a_mid_day_schema_rotation_compacts_by_name(lake_root):
     assert table.num_rows == 5
     assert table.column("vendor_new_field").null_count == 2
     assert result.sealed[0].rows == 5
+
+
+def test_a_mid_day_retype_refuses_the_merge_and_leaves_the_day_alone(lake_root):
+    # The other half of a rotation. A vendor field that arrived as an int all morning
+    # and as a float after lunch is not something unifying by name can reconcile. The
+    # merge widens nothing: silently promoting the column would bless a partition whose
+    # type changed inside one day, and the schema policy wants that failure loud. So the
+    # merge raises and the ticker-day stays exactly as the capture left it.
+    old_rows = _chains_rows(2, snap_ts=_snap(DAY, 0))
+    for row in old_rows:
+        row["open_interest"] = 100
+    index = CHAINS_SCHEMA.get_field_index("open_interest")
+    retyped = CHAINS_SCHEMA.set(index, pa.field("open_interest", pa.float64()))
+    new_rows = _chains_rows(3, snap_ts=_snap(DAY, 1))
+    for row in new_rows:
+        row["open_interest"] = 100.5
+    morning = _segment(
+        lake_root, "chains", "SPY", DAY, _table(CHAINS_SCHEMA, old_rows), start_ts="a"
+    )
+    afternoon = journal.segment_path(lake_root, "chains", "SPY", DAY, "b", PID)
+    with pa.OSFile(str(afternoon), "wb") as sink, pa.ipc.new_stream(sink, retyped) as writer:
+        writer.write_table(_table(retyped, new_rows))
+    morning_before = morning.read_bytes()
+    afternoon_before = afternoon.read_bytes()
+    events: list[str] = []
+
+    with pytest.raises(pa.ArrowTypeError):
+        _run(lake_root, backup=FakeBackup(events), pinger=FakePinger(events))
+
+    # Nothing was sealed: no partition, no manifest entry, both segments byte-identical.
+    # The backup and the ping never ran, so the failure reaches the health check as a
+    # missed ping rather than being reported as a healthy run.
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert read_manifest(lake_root) == []
+    assert morning.read_bytes() == morning_before
+    assert afternoon.read_bytes() == afternoon_before
+    assert events == []
 
 
 # -- 2. torn tails and shadow appends ----------------------------------------
@@ -1169,3 +1213,227 @@ def test_a_partition_that_re_reads_with_the_wrong_count_raises_and_manifests_not
     # The raise came before the backup and before the ping, so a run that sealed nothing
     # is never reported as healthy.
     assert events == []
+
+
+# -- 9. the prune deletes only an empty directory ----------------------------
+
+
+def test_a_stray_file_keeps_its_ticker_directory_through_the_prune(lake_root):
+    # Pruning is how a sealed date stops leaving empty shells behind, and the one thing
+    # it must never do is take a file with them. ``SEGMENT_GLOB`` carries the ``seg-``
+    # prefix, so a hand-made copy sitting beside the segments is not swept and not
+    # sealed. Its directory is therefore still populated when the prune reaches it.
+    paths = LakePaths(lake_root)
+    spy = _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    ticker_dir = paths.segment_dir("chains", "QQQ", DAY)
+    ticker_dir.mkdir(parents=True)
+    stray = ticker_dir / "copy-of-a-segment.arrows"
+    stray.write_bytes(b"not a segment")
+
+    result, _, _, _ = _run(lake_root)
+
+    # The prune did run over this date: SPY sealed and its own shell is gone.
+    assert [item.ticker for item in result.sealed] == ["SPY"]
+    assert not spy.exists()
+    assert not paths.segment_dir("chains", "SPY", DAY).exists()
+    # The stray file survives byte for byte, and so does every directory above it. The
+    # prune stops at the populated ticker directory rather than at the date.
+    assert stray.read_bytes() == b"not a segment"
+    assert ticker_dir.is_dir()
+    assert ticker_dir.parent.is_dir()
+    assert ticker_dir.parent.parent.is_dir()
+
+
+def test_a_repair_never_prunes_a_ticker_day_it_did_not_seal(lake_root):
+    # The human-invoked repair rebuilds one ticker-day and then prunes the whole date
+    # directory above it. Every other ticker-day under that date still holds the
+    # segments the repair did not read, which is unsealed captured data. Only the
+    # rebuilt ticker-day's now-empty shell goes.
+    paths = LakePaths(lake_root)
+    _manifested_day(lake_root, rows=1)
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    untouched = _segment(
+        lake_root,
+        "chains",
+        "QQQ",
+        DAY,
+        _chains(3, snap_ts=_snap(DAY, 0), ticker="QQQ"),
+        start_ts="a",
+    )
+    before = untouched.read_bytes()
+
+    outcome = recompact_ticker_day(lake_root, "chains", "SPY", DAY, clock=_clock_at(DAY, 17, 0))
+
+    assert outcome.rows == 2
+    assert not paths.segment_dir("chains", "SPY", DAY).exists()
+    # QQQ's segment is still there, unread and unsealed, waiting for the next sweep.
+    assert untouched.read_bytes() == before
+    assert not paths.chains_partition_path("QQQ", DAY).exists()
+
+
+def test_a_repair_prunes_the_whole_date_it_emptied(lake_root):
+    # The other direction, and what decides where the prune is rooted. The repair prunes
+    # from the date directory down rather than from the ticker directory it rebuilt, so
+    # repairing a date's only ticker-day leaves no shell at all. Rooted one level lower
+    # the surface directory would stand forever, and two levels lower the date with it.
+    paths = LakePaths(lake_root)
+    _manifested_day(lake_root, rows=1)
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    outcome = recompact_ticker_day(lake_root, "chains", "SPY", DAY, clock=_clock_at(DAY, 17, 0))
+
+    assert outcome.rows == 2
+    assert list(paths.journal_dir.iterdir()) == []
+
+
+# -- 10. a ticker-day with no segments ---------------------------------------
+
+
+def test_a_ticker_day_with_no_segments_never_ends_the_sweep_for_its_date(lake_root):
+    # An empty ticker directory is what a writer leaves when it creates the directory
+    # and dies before its first cycle, or what an interrupted prune leaves behind. The
+    # sweep passes over it and keeps going. One empty shell sits on each side of SPY in
+    # the walk, so a sweep that stopped at an empty one rather than skipping it would
+    # seal nothing for this date whichever end it started from. One shell alone would
+    # rest the test on the iteration order rather than on the skip.
+    paths = LakePaths(lake_root)
+    before = paths.segment_dir("chains", "AAA", DAY)
+    after = paths.segment_dir("chains", "ZZZ", DAY)
+    for shell in (before, after):
+        shell.mkdir(parents=True)
+    spy = _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    result, _, _, _ = _run(lake_root)
+
+    assert [item.ticker for item in result.sealed] == ["SPY"]
+    assert pq.read_table(paths.chains_partition_path("SPY", DAY)).num_rows == 2
+    assert not spy.exists()
+    # Both empty shells are pruned with the rest of the sealed date.
+    assert not before.exists() and not after.exists()
+    assert list(paths.journal_dir.iterdir()) == []
+
+
+def test_the_sweep_passes_over_every_journal_entry_it_cannot_use(lake_root):
+    # The journal root holds more than date directories. A Finder visit leaves
+    # ``.DS_Store`` there, and ``.`` sorts before ``date=``, so an entry filter that
+    # ended the walk rather than skipping the entry would seal nothing at all, every
+    # night, while the backup and the ping still reported the run healthy. A directory
+    # named for a date this pipeline never wrote sorts in among the real ones.
+    paths = LakePaths(lake_root)
+    paths.journal_dir.mkdir(parents=True, exist_ok=True)
+    junk = paths.journal_dir / ".DS_Store"
+    junk.write_bytes(b"\x00\x01")
+    foreign = paths.journal_dir / "notes"
+    foreign.mkdir()
+    not_a_date = paths.journal_dir / f"{DATE_PREFIX}2026-08-20-bad"
+    not_a_date.mkdir()
+    friday = _segment(
+        lake_root, "chains", "SPY", FRIDAY, _chains(4, snap_ts=_snap(FRIDAY, 0)), start_ts="a"
+    )
+    day = _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    result, _, _, _ = _run(lake_root)
+
+    # Both real dates sealed, so neither the stray file, the foreign directory, nor the
+    # unparseable date ended the sweep.
+    assert [(item.day, item.rows) for item in result.sealed] == [(FRIDAY, 4), (DAY, 2)]
+    assert not friday.exists() and not day.exists()
+    # The unparseable date is reported rather than swept, and nothing of it is deleted.
+    assert SkippedDay("date=2026-08-20-bad", "unparseable") in result.skipped
+    assert not_a_date.is_dir()
+    # A file at the journal root is not the sweep's business and is left where it is.
+    assert junk.read_bytes() == b"\x00\x01"
+    assert foreign.is_dir()
+
+
+def test_a_closed_date_between_two_sessions_never_ends_the_sweep(lake_root):
+    # A Saturday directory sorts between Friday and Monday, so a calendar filter that
+    # ended the walk would strand every session after it. Its segments are not the
+    # sweep's to touch either, because no session bounds exist to judge the date by.
+    orphan = _segment(
+        lake_root, "chains", "SPY", SATURDAY, _chains(1, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    before = orphan.read_bytes()
+    _segment(lake_root, "chains", "SPY", FRIDAY, _chains(4, snap_ts=_snap(FRIDAY, 0)), start_ts="a")
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    result, _, _, _ = _run(lake_root)
+
+    assert [(item.day, item.rows) for item in result.sealed] == [(FRIDAY, 4), (DAY, 2)]
+    assert SkippedDay(SATURDAY.isoformat(), "not_a_session") in result.skipped
+    assert orphan.read_bytes() == before
+
+
+def test_every_guarded_date_is_reported_not_just_the_first(lake_root):
+    # The guard skips today and every later date the lake happens to hold. A filter that
+    # ended the walk would report only the first, and the run's own report is the one
+    # place a held-back date is visible.
+    wednesday = date(2026, 8, 26)
+    calendar = FakeCalendar({day: _session(day) for day in (DAY, TUESDAY, wednesday)})
+    for day in (TUESDAY, wednesday):
+        _segment(lake_root, "chains", "SPY", day, _chains(1, snap_ts=_snap(day, 0)), start_ts="a")
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+
+    result, _, _, _ = _run(lake_root, clock=_clock_at(DAY, 16, 30), calendar=calendar)
+
+    assert [item.day for item in result.sealed] == [DAY]
+    assert result.skipped == (
+        SkippedDay(TUESDAY.isoformat(), "guard_open"),
+        SkippedDay(wednesday.isoformat(), "guard_open"),
+    )
+
+
+def test_the_ticker_day_walk_passes_over_entries_that_name_neither_key(lake_root):
+    # The same shape one and two levels down. A stray file or a foreign directory under
+    # a date directory is not a surface, and one under a surface directory is not a
+    # ticker. Every one of them sorts before the key it sits beside, so a filter that
+    # ended its walk would cost the whole date.
+    paths = LakePaths(lake_root)
+    segment = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    ticker_dir = paths.segment_dir("chains", "SPY", DAY)
+    surface_dir = ticker_dir.parent
+    date_dir = surface_dir.parent
+    (date_dir / "notes").mkdir()
+    (date_dir / "notes" / "readme").write_bytes(b"kept")
+    (surface_dir / "scratch").mkdir()
+    (surface_dir / "scratch" / "readme").write_bytes(b"kept")
+    (surface_dir / ".DS_Store").write_bytes(b"\x00")
+
+    result, _, _, _ = _run(lake_root)
+
+    assert [(item.ticker, item.rows) for item in result.sealed] == [("SPY", 2)]
+    assert not segment.exists()
+    # None of them is a segment, so the prune leaves each one and the shells holding it.
+    # Each foreign directory holds a file, because the prune takes any empty directory
+    # under a sealed date and an empty one would go on its own merits.
+    assert (date_dir / "notes" / "readme").read_bytes() == b"kept"
+    assert (surface_dir / "scratch" / "readme").read_bytes() == b"kept"
+    assert (surface_dir / ".DS_Store").read_bytes() == b"\x00"
+
+
+def test_a_stray_file_directly_under_a_date_directory_survives_the_prune(lake_root):
+    # The prune walks a date directory's children expecting surfaces. A plain file among
+    # them is not one, and reading it as a directory would raise out of ``compact`` after
+    # the seal and before the re-tune, the backup, and the ping. It sorts first, so it is
+    # the first thing the prune reaches.
+    paths = LakePaths(lake_root)
+    segment = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    date_dir = paths.segment_dir("chains", "SPY", DAY).parent.parent
+    junk = date_dir / ".DS_Store"
+    junk.write_bytes(b"\x00\x01")
+
+    result, events, _, _ = _run(lake_root)
+
+    assert [item.rows for item in result.sealed] == [2]
+    assert not segment.exists()
+    # The seal finished the run, so the prune neither raised nor deleted the file.
+    assert events == ["backup", "ping"]
+    assert junk.read_bytes() == b"\x00\x01"
+    # The emptied ticker and surface shells went. The date stays, because it holds the file.
+    assert not paths.segment_dir("chains", "SPY", DAY).exists()
+    assert not (date_dir / f"{SURFACE_PREFIX}chains").exists()
+    assert date_dir.is_dir()
