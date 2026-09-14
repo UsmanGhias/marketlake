@@ -23,7 +23,8 @@ and a second, older data day behind it.
   Friday as the reported last cycle.
 
 The clock reads Monday 09:40:30 ET. So the last SPY chains data cycle at 09:33 is 7.5
-minutes old, the slots through 09:40 are past, and everything after is pending.
+minutes old. The slots through 09:38 have outrun their verdict grace and are judged.
+09:39 and 09:40 have not, so they read pending alongside everything after them.
 
 Tests past the shared fixture build their own lake from the same row helpers, because
 each one needs a lake in a shape the shared fixture deliberately is not: a drifted
@@ -544,6 +545,117 @@ def test_inside_the_capture_window_the_owed_minute_is_now(root: Path):
     assert now["capture_owed_through"] == NOW.isoformat()
 
 
+def _opened_dark(fixture_lake: FixtureLake, monday_through: int | None = None) -> Path:
+    """A lake that captured Friday's option close, and Monday only as far as asked.
+
+    ``monday_through`` is the last Monday minute past 09:30 that landed a cycle, or None
+    for a Monday on which nothing ran at all.
+    """
+    fixture_lake.with_journal_segment(
+        "chains",
+        "SPY",
+        FRIDAY,
+        pa.Table.from_pylist(
+            [_chains("SPY", et(FRIDAY, 16, 15), occ_symbol="A")],
+            schema=journal.CHAINS_SCHEMA,
+        ),
+        start_ts="20260821T200000000000",
+        pid=1,
+    )
+    if monday_through is not None:
+        fixture_lake.with_journal_segment(
+            "chains",
+            "SPY",
+            MONDAY,
+            pa.Table.from_pylist(
+                [
+                    _chains("SPY", et(MONDAY, 9, minute), occ_symbol="A")
+                    for minute in range(30, monday_through + 1)
+                ],
+                schema=journal.CHAINS_SCHEMA,
+            ),
+            start_ts="20260824T133000000000",
+            pid=2,
+        )
+    return fixture_lake.build()
+
+
+def _spy_stale(root: Path, when: datetime) -> bool:
+    """Whether the Now panel paints SPY chains stale at one instant."""
+    now = service_over(root, now=when).run_query("now", {})
+    row = next(r for r in now["surfaces"] if r["ticker"] == "SPY" and r["surface"] == "chains")
+    return row["stale"]
+
+
+def test_the_open_minute_is_not_owed_until_its_cycle_could_have_landed(
+    fixture_lake: FixtureLake,
+):
+    # The bug this holds: inside the window the reference was the raw instant, so at
+    # 09:30:00 the newest cycle was still Friday's close and the age measured the weekend
+    # rather than anything this session did. Every ticker went red the moment the session
+    # opened, on a daemon doing exactly what it should, and cleared once the first row
+    # landed. That is a red-then-green flap on the loudest reading the panel has.
+    root = _opened_dark(fixture_lake)
+
+    assert _spy_stale(root, et(MONDAY, 9, 29, 59)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 30, 0)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 30, 30)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 31, 59)) is False
+
+
+def test_a_daemon_that_never_woke_reads_stale_once_the_open_grace_runs_out(
+    fixture_lake: FixtureLake,
+):
+    # The grace is a delay, not an amnesty. A daemon that never woke has to be caught, and
+    # the moment it can be is the moment the open minute becomes judgeable.
+    root = _opened_dark(fixture_lake)
+
+    assert _spy_stale(root, et(MONDAY, 9, 32, 0)) is True
+    assert _spy_stale(root, et(MONDAY, 9, 40, 0)) is True
+
+
+def test_the_open_cycle_landing_keeps_the_row_clean_across_the_grace(
+    fixture_lake: FixtureLake,
+):
+    # A daemon that captured the open reads clean on both sides of the boundary, so the
+    # grace running out is not itself an event a healthy session can be seen to cross.
+    root = _opened_dark(fixture_lake, monday_through=31)
+
+    assert _spy_stale(root, et(MONDAY, 9, 31, 59)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 32, 0)) is False
+    assert _spy_stale(root, et(MONDAY, 9, 33, 0)) is False
+
+
+def test_the_two_panels_agree_about_the_open(fixture_lake: FixtureLake):
+    # The reason the strip's own grace is the one reused here. _surface_stale names panel
+    # agreement as its reason for consulting scope, and a panel that called every ticker
+    # stale while the strip beside it reported nothing missing contradicted that. Both now
+    # turn at the same instant on the same dark session.
+    root = _opened_dark(fixture_lake)
+    for when, expected in (
+        (et(MONDAY, 9, 31, 59), False),
+        (et(MONDAY, 9, 32, 0), True),
+    ):
+        strip = service_over(root, now=when).run_query(
+            "today", {"date": "2026-08-24", "ticker": "SPY"}
+        )["strips"][0]
+        assert _spy_stale(root, when) is expected
+        assert (strip["counts"]["missing"] > 0) is expected
+
+
+def test_the_opening_grace_does_not_move_the_threshold(fixture_lake: FixtureLake):
+    # The over-reach check, and the one that matters most. The column reports the failure
+    # the watchdog counts, so the grace must reach the session's opening minutes and
+    # nothing else. A daemon that captured through 09:45 and then stopped still turns at
+    # 09:45 plus the injected threshold to the second, exactly as it did before.
+    root = _opened_dark(fixture_lake, monday_through=45)
+    threshold = timedelta(minutes=GuardConstants().watchdog_page_minutes)
+    turns_at = et(MONDAY, 9, 45) + threshold
+
+    assert _spy_stale(root, turns_at) is False
+    assert _spy_stale(root, turns_at + timedelta(seconds=1)) is True
+
+
 def test_a_ticker_onboarded_after_the_close_is_not_late_that_evening(root: Path):
     """Nothing was owed of a ticker whose epoch falls after the last owed minute.
 
@@ -906,13 +1018,14 @@ def test_today_denominates_a_regular_day_at_the_full_session(service: DashboardS
 def test_today_strip_carries_status_rows_and_gap_reason(service: DashboardService):
     today = service.run_query("today", {"date": "2026-08-24", "ticker": "SPY"})
     chains = today["strips"][0]
-    # Four slots with rows, seven past slots without, the rest still to come.
+    # Four slots with rows, five judged slots without, the rest still owed. 09:39 and
+    # 09:40 sit inside the verdict grace, so they are pending rather than missing.
     assert chains["counts"] == {
         "captured": 2,
         "suspect": 1,
         "gap": 1,
-        "missing": 7,
-        "pending": 395,
+        "missing": 5,
+        "pending": 397,
         "out_of_scope": 0,
     }
     assert chains["unreadable_segments"] == 1
@@ -949,8 +1062,8 @@ def test_today_defaults_to_every_ticker_and_the_clock_session_date(service: Dash
         "captured": 0,
         "suspect": 0,
         "gap": 1,
-        "missing": 10,
-        "pending": 395,
+        "missing": 8,
+        "pending": 397,
         "out_of_scope": 0,
     }
     assert qqq["slots"][0]["error_class"] == ["daemon_dead"]
@@ -974,6 +1087,162 @@ def test_today_renders_a_non_session_as_no_session(service: DashboardService):
     assert today["is_session"] is False
     assert today["slot_count"] == 0
     assert today["strips"] == []
+
+
+# -- the verdict grace: when a slot with no rows becomes judgeable -------------
+
+
+def _grace_lake(fixture_lake: FixtureLake) -> Path:
+    """A lake whose SPY chains captured 09:30 and 09:31 and nothing since.
+
+    This is the fixture the issue's reproduction ran against. 09:32 is the minute a
+    healthy daemon would be capturing right now, and no row for it exists yet.
+    """
+    return one_segment_lake(
+        fixture_lake,
+        [
+            _chains("SPY", et(MONDAY, 9, 30), occ_symbol="A"),
+            _chains("SPY", et(MONDAY, 9, 31), occ_symbol="A"),
+        ],
+    )
+
+
+def _strip_at(root: Path, when: datetime, surface: str = "chains") -> dict:
+    """One SPY surface's strip, read at one instant. Found by name, never by position."""
+    strips = service_over(root, now=when).run_query(
+        "today", {"date": "2026-08-24", "ticker": "SPY"}
+    )["strips"]
+    matching = [strip for strip in strips if strip["surface"] == surface]
+    assert len(matching) == 1, f"expected one {surface} strip, got {len(matching)}"
+    return matching[0]
+
+
+def _cell_at(root: Path, when: datetime, slot: datetime, surface: str = "chains") -> dict:
+    """One slot's whole cell on a SPY strip, read at one instant."""
+    strip = _strip_at(root, when, surface)
+    index = int((slot - et(MONDAY, 9, 30)).total_seconds() // 60)
+    cell = strip["slots"][index]
+    assert cell["slot"] == slot.isoformat()
+    return cell
+
+
+def _status_at(root: Path, when: datetime, slot: datetime, surface: str = "chains") -> str:
+    """One slot's status on a SPY strip, read at one instant."""
+    return _cell_at(root, when, slot, surface)["status"]
+
+
+@pytest.mark.parametrize("second", [0, 5, 30, 59])
+def test_the_minute_being_captured_is_never_called_missing(fixture_lake: FixtureLake, second: int):
+    # The bug this holds: the verdict ran against the raw instant, so 09:32 read missing
+    # from its own first second, before its cycle could have written anything. The cycle
+    # for a slot starts at the top of that minute and has to fetch, journal and fsync, so
+    # at every second of 09:32 that minute is still owed rather than absent.
+    root = _grace_lake(fixture_lake)
+    at = et(MONDAY, 9, 32, second)
+    assert _status_at(root, at, et(MONDAY, 9, 32)) == "pending"
+    # The two readings either side are unmoved. 09:31 landed a cycle and 09:33 is future.
+    assert _status_at(root, at, et(MONDAY, 9, 31)) == "captured"
+    assert _status_at(root, at, et(MONDAY, 9, 33)) == "pending"
+
+
+def test_a_slot_stays_pending_through_the_grace_minute_after_its_own(
+    fixture_lake: FixtureLake,
+):
+    # A cycle that overruns its minute is an ordinary slow sample to the loop, not a
+    # failure. Its row lands after the slot's own minute has ended. Judging at that end
+    # would call the slot missing and then flip it to captured on the next refresh, so
+    # the grace runs one further minute and the verdict never flaps on a healthy session.
+    root = _grace_lake(fixture_lake)
+    slot = et(MONDAY, 9, 32)
+    assert _status_at(root, et(MONDAY, 9, 33, 0), slot) == "pending"
+    assert _status_at(root, et(MONDAY, 9, 33, 59), slot) == "pending"
+
+
+def test_a_slot_is_judged_once_the_grace_has_run_out(fixture_lake: FixtureLake):
+    # The grace is a delay, not an amnesty. Two minutes past the slot the cycle has had
+    # its own minute and a full spare one, so a slot with still no row is genuinely
+    # absent and the strip says so.
+    root = _grace_lake(fixture_lake)
+    slot = et(MONDAY, 9, 32)
+    assert _status_at(root, et(MONDAY, 9, 34, 0), slot) == "missing"
+    assert _status_at(root, et(MONDAY, 9, 34, 1), slot) == "missing"
+
+
+def test_the_grace_is_the_span_the_constant_names(fixture_lake: FixtureLake):
+    # The boundary is read off SLOT_VERDICT_GRACE rather than hard-coded here, so a
+    # recalibration moves the test with it instead of leaving it asserting the old span.
+    root = _grace_lake(fixture_lake)
+    slot = et(MONDAY, 9, 32)
+    edge = slot + dashboard.SLOT_VERDICT_GRACE
+    assert _status_at(root, edge - timedelta(seconds=1), slot) == "pending"
+    assert _status_at(root, edge, slot) == "missing"
+
+
+def test_a_long_dead_morning_still_reads_missing(fixture_lake: FixtureLake):
+    # The over-reach check. The grace delays a verdict by two minutes and never withholds
+    # one, so a slot well past it with no row is missing exactly as before.
+    root = _grace_lake(fixture_lake)
+    at = et(MONDAY, 9, 40, 30)
+    for minute in range(32, 39):
+        assert _status_at(root, at, et(MONDAY, 9, minute)) == "missing"
+
+
+def test_the_grace_holds_on_the_quotes_surface_too(fixture_lake: FixtureLake):
+    # Both minute-cadence surfaces are captured by the same cycle, so both owe a slot on
+    # the same terms and both must wait the same grace. Every other test here reads the
+    # chains strip, which would leave a grace that reached one surface and not the other
+    # looking identical to one that reached both.
+    root = one_segment_lake(
+        fixture_lake,
+        [
+            _quotes("SPY", et(MONDAY, 9, 30)),
+            _quotes("SPY", et(MONDAY, 9, 31)),
+        ],
+        surface="quotes",
+    )
+    slot = et(MONDAY, 9, 32)
+    assert _status_at(root, et(MONDAY, 9, 32, 5), slot, "quotes") == "pending"
+    assert _status_at(root, et(MONDAY, 9, 33, 59), slot, "quotes") == "pending"
+    assert _status_at(root, et(MONDAY, 9, 34, 0), slot, "quotes") == "missing"
+    assert _status_at(root, et(MONDAY, 9, 30, 30), et(MONDAY, 9, 30), "quotes") == "captured"
+
+
+def test_a_gap_marker_inside_the_grace_is_still_a_gap(fixture_lake: FixtureLake):
+    # The grace reaches a slot with no rows at all and nothing else. A gap row is data,
+    # recording a missed minute and why, so a cycle that failed fast and journalled its
+    # reason inside the slot's own minute must read gap immediately. Waiting would hide a
+    # recorded failure behind a status that means nobody has looked yet, and the design
+    # pins a recorded gap and a hole as different failures.
+    root = one_segment_lake(
+        fixture_lake,
+        [
+            _chains("SPY", et(MONDAY, 9, 30), occ_symbol="A"),
+            _chains(
+                "SPY",
+                et(MONDAY, 9, 31),
+                kind=journal.ROW_KIND_GAP,
+                error_class="vendor_auth_error",
+            ),
+        ],
+    )
+    slot = et(MONDAY, 9, 31)
+    # Read five seconds into the minute after the gap's own, well inside the grace.
+    cell = _cell_at(root, et(MONDAY, 9, 32, 5), slot)
+    assert cell["status"] == "gap"
+    assert cell["error_class"] == ["vendor_auth_error"]
+    # The count carries it too, so a graced cell can never be rendered without being
+    # counted. The six counts still denominate the whole session.
+    strip = _strip_at(root, et(MONDAY, 9, 32, 5))
+    assert strip["counts"]["gap"] == 1
+    assert sum(strip["counts"].values()) == 406
+
+
+def test_a_slot_with_rows_is_captured_inside_its_own_grace(fixture_lake: FixtureLake):
+    # Data wins above the grace, so a cycle that lands promptly reads captured
+    # immediately rather than waiting two minutes to be believed.
+    root = _grace_lake(fixture_lake)
+    assert _status_at(root, et(MONDAY, 9, 31, 10), et(MONDAY, 9, 31)) == "captured"
+    assert _status_at(root, et(MONDAY, 9, 30, 1), et(MONDAY, 9, 30)) == "captured"
 
 
 # -- the contract's guards ---------------------------------------------------
@@ -1573,7 +1842,7 @@ def test_a_segment_without_row_kind_renders_missing_not_gaps(fixture_lake: Fixtu
     assert strip["drifted_segments"] == 1
     assert strip["counts"]["gap"] == 0
     assert strip["counts"]["captured"] == 0
-    assert strip["counts"]["missing"] == 11
+    assert strip["counts"]["missing"] == 9
     assert strip["slots"][0]["status"] == "missing"
 
 
@@ -1801,8 +2070,8 @@ def test_slots_before_capture_start_read_out_of_scope(root: Path):
         "captured": 2,
         "suspect": 1,
         "gap": 0,
-        "missing": 5,
-        "pending": 395,
+        "missing": 3,
+        "pending": 397,
         "out_of_scope": 3,
     }
     # 09:32 carried a gap marker. Before the epoch it is out of scope, never a gap.
