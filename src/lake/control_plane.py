@@ -196,6 +196,15 @@ CALENDAR_PROBE_SLUG = "calendar-probe"
 PRE_OPEN_SLUG = "pre-open"
 SUNDAY_SLUG = "sunday"
 
+# The slug of the dead-man check the daemon feeds. It sits here with its three siblings
+# rather than in ``lake.deadman`` because the install renderer names it too, and
+# ``lake.deadman`` imports this module. Reaching the other way would load a second copy
+# of this module under ``python -m lake.control_plane``. ``lake.deadman`` re-exports it,
+# so every consumer still reads it from there. Slice 1's ``slice1-capture`` check
+# retires when this takes over: leaving the old row in place makes it go silent and page
+# for a job that no longer runs, so deleting it is an operator step.
+CAPTURE_SLUG = "capture"
+
 # The system PATH a LaunchDaemon gets. launchd gives a job a minimal environment, so
 # the plist restores the OS tool directories the jobs shell out to: pmset, launchctl,
 # tmutil, caffeinate, and rsync. These are OS locations, not machine-specific paths.
@@ -2183,8 +2192,9 @@ def install_script(host: LaunchdHost) -> str:
        rejected drop-in skip its own install and the rest of the install continue.
     2. It echoes each command before running it, so the transcript shows what ran as
        root.
-    3. It ends on ``launchctl print``, so the operator reads whether the daemon came up
-       rather than assuming it.
+    3. Its last command is ``launchctl print``, so the operator reads whether the daemon
+       came up rather than assuming it. Two comment-only blocks close the file after it,
+       the token pointer and the arming step, because neither is a command.
 
     Paths resolve from the script's own directory rather than from a baked absolute
     path, so moving the rendered directory does not break it. Step 6 is deliberately
@@ -2203,10 +2213,15 @@ def install_script(host: LaunchdHost) -> str:
                 body.append(f"echo {shlex.quote('+ ' + command)}")
                 body.append(command)
 
-    # The token pointer closes the script. It is comment-only, so it runs nothing and
+    # The token pointer follows the read-back. It is comment-only, so it runs nothing and
     # cannot fail under ``set -e``, and it sits after the read-back rather than before it
     # because a machine with no jobs installed has nothing for a token to feed.
     body += _token_step_lines()
+
+    # Arming the check closes the script. It is comment-only for the same reason the
+    # token pointer is, and it is last because it is the last step of the first install
+    # and must not run before the bootstrap above.
+    body += _arm_capture_step_lines()
 
     # Counted from the body rather than written down, so the header cannot drift from
     # what the script actually runs.
@@ -2608,6 +2623,45 @@ def _token_step_lines() -> list[str]:
     ]
 
 
+def _arm_capture_step_lines() -> list[str]:
+    """Arming the capture check, as comment lines, for both renderings of the install.
+
+    One source for two renderings, the same reason ``_first_install_lines`` is one. The
+    install script closes on these lines and the install text prints the same block, so
+    the two cannot drift about whether the check gets armed.
+
+    Every line is a comment. Pressing a button on a web page needs a browser and a
+    person, so the install points at the step rather than takes it. That is also what
+    keeps the script safe. ``install_script`` runs under ``set -e``, and a runnable line
+    that cannot succeed would stop the install.
+
+    It sits after the bootstrap and never before, which the design's dead-man section
+    pins. A check armed before the jobs are loaded makes the page that follows about the
+    install order rather than about the daemon.
+
+    It names the check by its slug and carries no URL. A healthchecks ping URL is a
+    secret, and a rendered directory has to stay safe to paste into a bug report. The
+    slug is what the operator has to read, because healthchecks lists a check under its
+    name and the retired slice-1 row's name also carries the word capture.
+    """
+    return [
+        f"# Arming the {CAPTURE_SLUG} check. This is the last step of the first install,",
+        "# and it happens after the bootstrap above and never before. A check armed ahead",
+        "# of the jobs makes the page that follows about the install order rather than",
+        "# about the daemon.",
+        f"# Open healthchecks.io and press Ping Now on the {CAPTURE_SLUG} check, the one",
+        "# the daemon feeds every cycle. The list shows a check by name rather than by",
+        "# slug, and a retired slice-1 row can still be sitting beside it, so read the",
+        "# slug before pressing.",
+        "# healthchecks keeps a check that has never been pinged in a new state, which",
+        "# never goes down and never sends. Inside the capture window no idle heartbeat",
+        f"# is owed, so an install whose every cycle fails leaves the {CAPTURE_SLUG} row",
+        "# reading Never. That is what happened on 2026-09-08, when the jobs came up at",
+        "# 13:06 ET against a token that had expired three days earlier. One press turns",
+        "# that silence into a page inside the grace period.",
+    ]
+
+
 def reauth_script(host: LaunchdHost) -> str:
     """The weekly Schwab re-auth as a script the operator runs. The renderer never runs it.
 
@@ -2716,6 +2770,7 @@ def install_commands(out_dir: Path, host: LaunchdHost) -> str:
     ):
         lines.append(f"{item[0]} && {item[1]}" if isinstance(item, tuple) else item)
     lines += _token_step_lines()
+    lines += _arm_capture_step_lines()
     lines += [
         "# 6. Set the Sunday one-shot. The slice-3 vendor sweep will do this every Friday.",
         "# Until that sweep lands, run this line each Friday and run the second command it",
@@ -2989,6 +3044,7 @@ def _exchange_calendar() -> Calendar:
 
 __all__ = [
     "CANARY_DEADLINE",
+    "CAPTURE_SLUG",
     "CANARY_RETRY",
     "CANARY_SYMBOL",
     "DAEMON_LABEL",

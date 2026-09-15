@@ -999,18 +999,35 @@ def test_the_reauth_script_says_it_cannot_run_unattended(tmp_path):
     assert "refuses when stdin is not a terminal" in header
 
 
-def test_the_reauth_script_bakes_in_no_url(tmp_path):
+def test_nothing_rendered_bakes_in_a_secret_url(tmp_path, capsys):
     """The renderer reads no config, so no callback and no secret can reach a file.
 
     ``render_all`` takes a ``LaunchdHost`` and nothing else, so it cannot know the
-    registered callback. The script names the config key and leaves the value to the
-    tool, which is what keeps a rendered directory safe to paste into a bug report.
+    registered callback or the healthchecks ping key. Every rendering names a config key
+    or a check slug and leaves the value to the tool, which is what keeps a rendered
+    directory safe to paste into a bug report.
+
+    The sweep covers every rendered file and the install text rather than the re-auth
+    script alone. The arming step names a healthchecks row, and a ping URL written
+    beside it would put a secret in a tracked rendering.
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    text = (out / cp.REAUTH_SCRIPT_FILE).read_text()
-    assert "://" not in text
-    assert f"{cp.CALLBACK_KEY}:" not in text
+    texts = {path.name: path.read_text() for path in out.iterdir()}
+    texts["INSTALL.txt"] = capsys.readouterr().out
+    assert set(texts) == EXPECTED_FILES | {"INSTALL.txt"}
+    for name, text in texts.items():
+        for marker in ("hc-ping.com", "healthchecks.io/", "ntfy.sh", f"{cp.CALLBACK_KEY}:"):
+            assert marker not in text, (name, marker)
+        # A ping key needs no host beside it to be a secret, so its shape is swept for
+        # too. healthchecks mints one as a UUID. The sweep names shapes rather than
+        # refusing "://" outright, because every plist carries the Apple DTD URL, and it
+        # avoids a bare run-length rule, because a tmp_path directory name trips one.
+        assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-", text), name
+        assert not re.search(r"\b[0-9a-f]{32}\b", text), name
+    # The re-auth script carries no URL at all. Its one job is the browser login, so a
+    # baked-in callback is likelier there than anywhere else.
+    assert "://" not in texts[cp.REAUTH_SCRIPT_FILE]
 
 
 def test_the_rendered_reauth_script_runs_and_forwards_its_arguments(tmp_path):
@@ -1052,6 +1069,177 @@ def test_the_rendered_reauth_script_runs_and_forwards_its_arguments(tmp_path):
     assert log.read_text().splitlines() == [
         f"{project}|-m lake.reauth --config /tmp/throwaway.yaml"
     ]
+
+
+# -- arming the capture check --------------------------------------------------
+
+# The button the operator presses. Every test below finds the step by this phrase rather
+# than by the slug, so a rendering that dropped the slug is still found and still fails
+# the test that asks for it.
+PING_NOW = "Ping Now"
+
+
+def _pressed(text: str) -> int:
+    """The index of the one rendered line telling the operator to press the button."""
+    hits = [i for i, line in enumerate(text.splitlines()) if PING_NOW in line]
+    assert len(hits) == 1, hits
+    return hits[0]
+
+
+def _rendered_install(tmp_path: Path, capsys) -> tuple[str, str]:
+    """The install script and the install text from one render, in that order."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    return (out / cp.INSTALL_SCRIPT_FILE).read_text(), capsys.readouterr().out
+
+
+def _arming_block(text: str) -> list[str]:
+    """The rendered lines of the arming step, found by the run that holds the button.
+
+    Bounded by the step itself rather than by a line count, so the block is located
+    without asserting what it says. The press line anchors it and the run extends to the
+    length the renderer produced.
+    """
+    lines = text.splitlines()
+    start = _pressed(text) - cp._arm_capture_step_lines().index(
+        next(line for line in cp._arm_capture_step_lines() if PING_NOW in line)
+    )
+    return lines[start : start + len(cp._arm_capture_step_lines())]
+
+
+def test_both_renderings_carry_one_arming_step(tmp_path, capsys):
+    """The same block, whole and contiguous, in the script and in the pasted text.
+
+    The other tests in this section ask each rendering the same questions separately, so
+    a second copy of the step that answered all of them would pass while saying
+    something different from the first. That is the drift one shared source exists to
+    stop, and only the golden files caught it. A golden carries a documented way to
+    regenerate, so a drift blessed by a refresh left nothing red.
+    """
+    step = cp._arm_capture_step_lines()
+    assert step, step
+    for text in _rendered_install(tmp_path, capsys):
+        assert _arming_block(text) == step, text
+
+
+def test_the_step_reads_the_slug_rather_than_spelling_it(tmp_path, capsys):
+    """Renaming the check moves the rendering, rather than leaving it pointing nowhere.
+
+    Comparing the rendering against the constant's current value cannot tell a real read
+    from the same word typed twice. Both agree either way. Renaming the check under the
+    test is what separates them, and it is the rename that would otherwise ship an
+    install pointing the operator at a row that no longer exists.
+    """
+    monkey = "sentinel-slug"
+    for text in _rendered_install(tmp_path, capsys):
+        assert monkey not in text
+
+    import lake.control_plane
+
+    original = lake.control_plane.CAPTURE_SLUG
+    try:
+        lake.control_plane.CAPTURE_SLUG = monkey
+        for text in _rendered_install(tmp_path, capsys):
+            line = text.splitlines()[_pressed(text)]
+            assert monkey in line, line
+            assert original not in _arming_block(text)[_pressed_offset()], line
+    finally:
+        lake.control_plane.CAPTURE_SLUG = original
+
+
+def _pressed_offset() -> int:
+    """Where the press line sits inside the step, so the rename check reads that line."""
+    step = cp._arm_capture_step_lines()
+    return next(i for i, line in enumerate(step) if PING_NOW in line)
+
+
+def test_the_arming_step_closes_the_rendered_install(tmp_path, capsys):
+    """Both renderings end their install on it, because it is the last step of installing.
+
+    The check the daemon feeds never goes down until something pings it, so an install
+    whose every cycle fails leaves that row silent. Arming it is the step that turns the
+    silence into a page, and a step the operator never reaches is the same as no step.
+
+    Both renderings are checked, because the same install is rendered twice. A step
+    added to the script and not to the pasted text is the half-fix this guards.
+    """
+    script, printed = _rendered_install(tmp_path, capsys)
+
+    # The script closes on the step. Nothing follows it, and the token pointer, the one
+    # other comment-only block, comes before it.
+    lines = script.rstrip("\n").splitlines()
+    press = _pressed(script)
+    assert all(not line or line.startswith("#") for line in lines[press:]), lines[press:]
+    # The step's own last line is the file's last line. Compared against the step rather
+    # than against the words it happens to use, so rewording the block is free and
+    # appending anything after it is not.
+    assert lines[-1] == cp._arm_capture_step_lines()[-1]
+    token = next(i for i, line in enumerate(lines) if line.startswith("# The token."))
+    assert token < press
+
+    # The text carries the same block last, ahead of the standing Friday task. Step 6
+    # is not part of the first install, and the reference notes under it are not steps.
+    text_lines = printed.splitlines()
+    text_press = _pressed(printed)
+    text_token = next(i for i, line in enumerate(text_lines) if line.startswith("# The token."))
+    friday = next(i for i, line in enumerate(text_lines) if line.startswith("# 6."))
+    assert text_token < text_press < friday
+
+
+def test_the_arming_step_comes_after_the_jobs_are_bootstrapped(tmp_path, capsys):
+    """Order, not presence. Arming ahead of the bootstrap pages about the install order.
+
+    A check armed before the jobs are loaded starts its grace running against a machine
+    that has nothing to ping it, so the page that follows says the operator was slow
+    rather than that the daemon is broken. The read-back sits between the two, so the
+    step lands after the operator has seen whether the daemon came up.
+    """
+    for text in _rendered_install(tmp_path, capsys):
+        lines = text.splitlines()
+        bootstraps = [
+            i for i, line in enumerate(lines) if line.startswith("sudo launchctl bootstrap")
+        ]
+        assert len(bootstraps) == 5, bootstraps
+        read_back = [
+            i
+            for i, line in enumerate(lines)
+            if line.startswith(f"launchctl print {cp.LAUNCHD_DOMAIN}/{cp.DAEMON_LABEL}")
+        ]
+        assert len(read_back) == 1, read_back
+        assert max(bootstraps) < read_back[0] < _pressed(text), text
+
+
+def test_the_arming_step_names_the_check_by_its_slug(tmp_path, capsys):
+    """The line saying which button to press says which row to press it on.
+
+    Healthchecks shows one row per job, and the install has just loaded five. Naming the
+    row is the whole instruction. The slug is also all the step may carry: a ping URL is
+    a secret and the renderer's output is tracked.
+    """
+    from lake.deadman import CAPTURE_SLUG
+
+    for text in _rendered_install(tmp_path, capsys):
+        line = text.splitlines()[_pressed(text)]
+        assert re.search(rf"\b{re.escape(CAPTURE_SLUG)}\b", line), line
+
+
+def test_every_line_of_the_arming_step_is_a_comment(tmp_path, capsys):
+    """``set -e`` cannot trip on it, because there is nothing there to run.
+
+    Pressing a button on a web page needs a browser and a person. Rendered as a command
+    it would be a command that cannot succeed, and the script stops at the first failure
+    by design, so the install would end by failing on the step that closes it.
+    """
+    script, printed = _rendered_install(tmp_path, capsys)
+    lines = script.rstrip("\n").splitlines()
+    runnable = [line for line in lines if line and not line.startswith("#")]
+    # The last thing the script runs is the read-back. Anything the arming step added
+    # would run after it.
+    assert runnable[-1] == f"launchctl print {cp.LAUNCHD_DOMAIN}/{cp.DAEMON_LABEL}", runnable[-1]
+    # Both renderings, not the script alone. The pasted text is run by hand line by
+    # line, so a runnable line there is a command the operator runs at a browser step.
+    for text in (script, printed):
+        assert all(line.startswith("#") for line in _arming_block(text)), text
 
 
 # -- the golden rendering ------------------------------------------------------
