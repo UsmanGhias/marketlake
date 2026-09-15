@@ -30,6 +30,21 @@ Cut a large deliverable down to the part that runs against data the lake already
 
 The price of this is named rather than hidden. Shipping the usable path first leaves gaps open on paths nothing has exercised, and one of them will eventually cost something. That is accepted on purpose, inside the three exceptions above. A lake nobody can read produces no evidence about which hardening mattered, so the deferred work is also the work with the least evidence behind it.
 
+**Audit an issue's plan before starting work on it (owner directive, 2026-09-15).** An issue is where a plan lives, and a plan is a hypothesis about work that has not happened yet. What usually makes one wrong is that the files it names moved after it was written. So the trigger is narrow rather than universal. Run `git log` on the files an issue names, bounded by the issue's own date, and audit the plan when they have changed. A plan written against files that have sat still is a plan nothing has invalidated. The session that spawns the work runs the audit before it spawns, since that is the last moment a correction can reach the issue ahead of the reader who acts on it.
+
+Two checks have each already caught something.
+
+1. Check the issue's stated blocker against the current code. #242 said pruning a read down to one minute would rest on compaction's incidental row ordering, and concluded the real fix was a change to the writer. Parquet skips only the row groups whose statistics prove they cannot match, so ordering decides how many groups are skipped and never which rows come back. A fixture written in deliberately shuffled order, with overlapping row-group ranges, returned every row a full read returned. The writer was never involved and the work stayed in the reader.
+2. Read what the code already decided in writing. #249 resolves the lake root from config, and `src/lake/loader.py` ends its module docstring by stating that nothing in it reads a config file. That sentence was a deliberate decision. A session meeting it mid-change either deletes it quietly or stops to ask.
+
+An audit is a plan too, so it names the commit it was derived against. #249's body cites that docstring sentence at `src/lake/loader.py:99` and counts 35 call sites in one test file. #251 merged thirty minutes later, moving the sentence to line 170 and the call sites to 49. #201's body already carries the practice that prevents this. It pins its line numbers to a named commit and tells the reader to re-sweep for the class rather than trust the list.
+
+A correction goes on the issue, because a spawned session reads the issue and reads none of the conversation that started it. #242's body carries its own disproof, and #249's body names the sentence it contradicts. An audit that found nothing reports that to whoever asked for it and writes nothing, since an issue padded with empty notes is harder to read, which is what writing to the issue was meant to protect.
+
+Where the audit finds the code contradicting the issue, the issue still decides what the deliverable is, per the tracker directive above. What changes is that the code's stated reason becomes something the issue answers in advance rather than something the work runs into halfway through.
+
+The price is a pass over the files before work starts, paid on issues whose files have moved. The same evidence that sets the trigger bounds it. Two audits found something, and both ran on read-layer issues on the day the loader shipped, while the code they named was still moving. Seventy closed issues before them are not cited.
+
 ## Writing style (owner directive, 2026-08-26)
 
 Clarity comes first. Write plain sentences a reader understands on one read. Prefer short, complete sentences, but never at the cost of clarity. Do not chop an idea into cryptic one-idea fragments. When a short sentence turns hard to parse, write the clear sentence instead, even if it runs a little longer. Explain as you go, like teaching, so the reader follows without backtracking. Avoid em dashes and semicolons. Break a genuinely long sentence into two when that reads better. This applies to every prose surface: this file, the design doc, commit messages, PR bodies, and chat replies. Use plain language. Give the intuition first. Put the precise rule right behind it.
