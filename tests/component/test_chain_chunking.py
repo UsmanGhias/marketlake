@@ -817,20 +817,25 @@ def _retyped_expiration_response(expirations: list[str]) -> VendorResponse:
     return VendorResponse(status=200, body=body)
 
 
-def _untransformable_quote_time_response(expirations: list[str]) -> VendorResponse:
+def _colliding_contract_response(expirations: list[str]) -> VendorResponse:
     """A body that merges cleanly and that the row builder then rejects outright.
 
-    The drift is in ``quoteTimeInLong``, which the builder consumes into
-    ``vendor_quote_ts`` rather than copying into a column of its own. A transformed value
-    is this code's rather than the vendor's, so the overflow has no key for it and the
-    routing has nowhere honest to park it. The refusal propagates, which is the fail-open
-    branch this file's second test covers.
+    The drift is two fields at once, because the collision needs both. A contract field
+    named ``chain`` is written flat into the overflow, which is exactly the key the
+    chain-level values nest under, and a retyped ``underlyingPrice`` is what sends a
+    chain-level value there. Merging the second into the first would hide the parser's own
+    block inside a value the vendor sent, so the row refuses by name and the refusal
+    propagates, which is the fail-open branch this file's second test covers.
 
-    A chain-level field used to reach this branch and no longer does. Its value is the
-    vendor's own and it routes under ``chain``, which is marketlake #152.
+    Two drifts used to reach this branch on their own and no longer do. A chain-level field
+    routes under ``chain``, which is marketlake #152. The per-contract ``quoteTimeInLong``
+    nulls its stamp and routes under its own name, which is marketlake #223. Each carries a
+    value the vendor sent, and the collision above is the case where there is no honest key
+    left to put one under.
     """
     body = _chain_body(expirations)
-    body["callExpDateMap"][f"{expirations[0]}:7"]["650.0"][0]["quoteTimeInLong"] = "not-an-epoch"
+    body["underlyingPrice"] = "six hundred and fifty"
+    body["callExpDateMap"][f"{expirations[0]}:7"]["650.0"][0]["chain"] = {"nested": 1}
     return VendorResponse(status=200, body=body)
 
 
@@ -847,7 +852,7 @@ def _retyped_header_response(expirations: list[str]) -> VendorResponse:
 
 
 def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_root):
-    """A reassembled body Arrow refuses becomes a gap row, and the cycle runs on.
+    """A reassembled body the row builder refuses becomes a gap row, and the cycle runs on.
 
     Every window succeeds and the snapshot reassembles, so the failure lands where the row
     builder runs rather than in the fetch. Letting it propagate would leave the cycle
@@ -855,15 +860,16 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     would reach the same minute and do it again. So it fails open: the chain is one gap row
     carrying the failure's own class, and the quote surface for the same cycle still lands.
 
-    The drift is in a transformed field on purpose. A field the parser copies verbatim
-    routes into ``extra`` and the cycle lands, whether it arrives on the contract or at the
-    top of the body, and the two tests below cover both. This branch is what is left once
-    they do, and it still has to hold.
+    The drift is a collision on purpose, because collisions are what is left. A field the
+    parser copies verbatim routes into ``extra`` and the cycle lands, whether it arrives on
+    the contract or at the top of the body, and the two tests below cover both. A field the
+    builder transforms routes now too, per marketlake #223. What still costs the chain is a
+    row with no honest key to put a value under, which is the case the helper above builds.
     """
     plan = ChainPlan(((0, 9), (10, None)))
     vendor = _WindowVendor(
         windows={
-            (_d(0), _d(9)): _untransformable_quote_time_response(["2026-08-28"]),
+            (_d(0), _d(9)): _colliding_contract_response(["2026-08-28"]),
             (_d(10), None): _chain_response(["2026-09-18"]),
         },
     )
@@ -872,7 +878,7 @@ def test_a_body_the_row_builder_rejects_fails_open_to_a_whole_chain_gap(lake_roo
     outcome = result.segment(CHAINS, "SPY")
     assert outcome.row_kind == journal.ROW_KIND_GAP
     # The class is the exception's own name, snake-cased, the way every raised failure is
-    # classified. The epoch-to-ISO conversion refuses the string with a ValueError.
+    # classified. The overflow collision refuses the row with a ValueError.
     assert outcome.error_class == "value_error"
     assert outcome.rows == 1
 
