@@ -390,6 +390,8 @@ def test_the_minutes_a_live_overrun_slept_through_charge_the_watchdog(tmp_path):
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
     assert page.title == "Capture down: XYZ quotes"
+    # No class is named, and that is the point rather than an omission. Nothing was
+    # attempted in a slept-through slot, so there is no failure to name.
     assert page.body == "3 session minutes without a durable cycle"
 
 
@@ -799,10 +801,196 @@ def test_a_mid_session_recalibration_reaches_the_watchdog(tmp_path):
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
     assert page.title == "Capture down: XYZ quotes"
-    assert page.body == f"{RECALIBRATED_PAGE_MINUTES} session minutes without a durable cycle"
+    assert page.body == (
+        f"{RECALIBRATED_PAGE_MINUTES} session minutes without a durable cycle, failing with boom"
+    )
 
 
 # -- 9. an empty roster keeps the daemon running ---------------------------------------
+
+
+class _RateLimited:
+    """A cycle runner whose every cycle gaps one surface with a rate-limit class."""
+
+    def __init__(self, rig: _Rig, clock: ManualClock):
+        self._rig = rig
+        self._clock = clock
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segment = SegmentOutcome(
+            surface=journal.QUOTES_SURFACE,
+            ticker="XYZ",
+            path=self._rig.lake_root / "segment.arrows",
+            partition="quotes/ticker=XYZ/date=2026-09-02/segment.arrows",
+            row_kind=journal.ROW_KIND_GAP,
+            rows=1,
+            error_class="http_429",
+            fetched_at=None,
+        )
+        return CycleResult(snap_ts=slot, segments=(segment,))
+
+
+def test_a_surface_page_names_the_class_it_is_failing_with(tmp_path):
+    """The title says what went quiet, and the body has to say why.
+
+    A rate limit that starves one ticker while another still lands rows is not a
+    whole-daemon cause, so the page that goes out names the ticker. Without the class in
+    the body, that page sends the operator to look at one dead surface when the budget is
+    what is failing. The watchdog has held the class all along and dropped it here.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_RateLimited(rig, clock))
+
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.title == "Capture down: XYZ quotes"
+    assert page.body == "3 session minutes without a durable cycle, failing with http_429"
+
+
+class _WholeDaemonFailure:
+    """A cycle runner whose every cycle fails both surfaces with one auth class."""
+
+    def __init__(self, rig: _Rig, clock: ManualClock):
+        self._rig = rig
+        self._clock = clock
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segments = tuple(
+            SegmentOutcome(
+                surface=surface,
+                ticker="XYZ",
+                path=self._rig.lake_root / "segment.arrows",
+                partition=f"{surface}/ticker=XYZ/date=2026-09-02/segment.arrows",
+                row_kind=journal.ROW_KIND_GAP,
+                rows=1,
+                error_class="http_401",
+                fetched_at=None,
+            )
+            for surface in (journal.QUOTES_SURFACE, "chains")
+        )
+        return CycleResult(snap_ts=slot, segments=segments)
+
+
+def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
+    """The page that names a whole-daemon cause goes out through the same composer.
+
+    A dead token arrives as ``http_401`` while the cached access token still works and as
+    ``vendor_auth_error`` once the refresh fails. Both carry the one title, so the class
+    in the body is what says which shape arrived. Only a single-surface page held the
+    class before this, so a body composer that skipped multi-surface pages passed.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_WholeDaemonFailure(rig, clock))
+
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.title == "Capture down: token dead"
+    # Two surfaces of one ticker, folded into this page. It counts surfaces rather than
+    # tickers, because a cause takes both surfaces of every ticker down together.
+    assert page.body == (
+        "3 session minutes without a durable cycle, failing with http_401, one page for 2 surfaces"
+    )
+
+
+class _DeadSampler:
+    """A cycle runner that gaps every quotes ticker in the batch, every cycle.
+
+    The class is one no whole-daemon cause names, so the cycle reaches the sampler
+    collapse rather than being reported as a cause.
+    """
+
+    def __init__(self, rig: _Rig, clock: ManualClock, tickers: tuple[str, ...]):
+        self._rig = rig
+        self._clock = clock
+        self._tickers = tickers
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segments = tuple(
+            SegmentOutcome(
+                surface=journal.QUOTES_SURFACE,
+                ticker=ticker,
+                path=self._rig.lake_root / "segment.arrows",
+                partition=f"quotes/ticker={ticker}/date=2026-09-02/segment.arrows",
+                row_kind=journal.ROW_KIND_GAP,
+                rows=1,
+                error_class="boom",
+                fetched_at=None,
+            )
+            for ticker in self._tickers
+        )
+        return CycleResult(snap_ts=slot, segments=segments)
+
+
+@pytest.mark.parametrize("size", [2, 3, 7])
+def test_the_sampler_page_says_how_many_tickers_it_stands_for(size, tmp_path):
+    """A folded page has to say how much it folded.
+
+    The design folds every quotes ticker into one page rather than sending N, and the
+    same rule makes compaction's drift page name how many columns it left. Without the
+    count, one page for two tickers and one page for four hundred read identically, and
+    the quotes batch runs to hundreds of symbols per request.
+
+    The count comes off the page's own surfaces rather than a constant, so a roster that
+    changed mid-session reports what it is now.
+    """
+    tickers = tuple(f"T{index:02d}" for index in range(size))
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_DeadSampler(rig, clock, tickers))
+
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: quote sampler dead"
+    assert page.body == (
+        f"3 session minutes without a durable cycle, failing with boom, one page for {size} tickers"
+    )
+
+
+class _SplitSampler:
+    """A cycle runner that gaps every quotes ticker, half of them with a second class."""
+
+    def __init__(self, rig: _Rig, clock: ManualClock, tickers: tuple[str, ...]):
+        self._rig = rig
+        self._clock = clock
+        self._tickers = tickers
+
+    def __call__(self, *, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        slot = self._clock.now().replace(second=0, microsecond=0)
+        segments = tuple(
+            SegmentOutcome(
+                surface=journal.QUOTES_SURFACE,
+                ticker=ticker,
+                path=self._rig.lake_root / "segment.arrows",
+                partition=f"quotes/ticker={ticker}/date=2026-09-02/segment.arrows",
+                row_kind=journal.ROW_KIND_GAP,
+                rows=1,
+                error_class="boom" if index % 2 else "timeout",
+                fetched_at=None,
+            )
+            for index, ticker in enumerate(self._tickers)
+        )
+        return CycleResult(snap_ts=slot, segments=segments)
+
+
+def test_a_folded_page_whose_tickers_disagree_still_says_how_many(tmp_path):
+    """The emptiest page the system can send is the one that most needs the count.
+
+    A collapsed page names no class when its tickers report more than one, because there
+    is no single class to honestly name. The count is then the only thing the body has
+    left to say beyond the minutes, so it has to survive the class being absent.
+    """
+    tickers = ("T00", "T01", "T02", "T03")
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_SplitSampler(rig, clock, tickers))
+
+    (page,) = rig.transport.sent
+    assert page.title == "Capture down: quote sampler dead"
+    assert page.body == "3 session minutes without a durable cycle, one page for 4 tickers"
 
 
 def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):

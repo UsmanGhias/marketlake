@@ -1064,12 +1064,30 @@ def run_loop_from_config(
 
     def raise_pages(pages: list[Page], now: datetime) -> None:
         for page in pages:
+            # The title says what went quiet. The class says why, and without it a rate
+            # limit that starves one ticker reads as that ticker being dead. A page with
+            # no class says nothing rather than guessing: a slept-through slot attempted
+            # no request, and a collapsed sampler page whose tickers disagreed has no one
+            # class to name.
+            body = f"{page.minutes} session minutes without a durable cycle"
+            if page.cause is not None:
+                body = f"{body}, failing with {page.cause}"
+            # A folded page says how much it folded, the rule compaction's drift page
+            # already follows. Two pages here fold: the sampler page stands for every
+            # quotes ticker, and the cause page stands for every surface that failed the
+            # same way. Without the count, one page for two and one page for four hundred
+            # read identically. A page standing for one surface has its title to say so.
+            #
+            # The names are left out because both folds only fire when the whole set
+            # failed, so listing them says no more than the count does and costs the
+            # body's byte budget as the roster grows. The sampler's set is every surface
+            # on one ticker apiece, so it counts tickers. The cause page spans both
+            # surfaces of every ticker, so it counts surfaces.
+            if len(page.surfaces) > 1:
+                folded = "tickers" if page.sampler_collapse else "surfaces"
+                body = f"{body}, one page for {len(page.surfaces)} {folded}"
             publisher.publish(
-                Message(
-                    event="capture_down",
-                    title=page.title,
-                    body=f"{page.minutes} session minutes without a durable cycle",
-                ),
+                Message(event="capture_down", title=page.title, body=body),
                 now=now,
             )
 
