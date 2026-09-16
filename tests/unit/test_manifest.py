@@ -19,10 +19,10 @@ from lake.manifest import (
     _compacted_partition_for_segment,
     _is_excluded,
     _latest_by_partition,
-    _parse_jsonl,
     latest_entries,
     latest_quarantine,
     manifest_path,
+    parse_jsonl,
     quarantine_path,
 )
 
@@ -38,24 +38,24 @@ def _entry(partition: str, **extra) -> dict:
 
 def test_parse_reads_every_complete_line():
     text = "".join(json.dumps(_entry(p)) + "\n" for p in ("a", "b", "c"))
-    parsed = _parse_jsonl(text)
+    parsed = parse_jsonl(text)
     assert [e["partition"] for e in parsed] == ["a", "b", "c"]
 
 
 def test_parse_skips_blank_lines():
     text = json.dumps(_entry("a")) + "\n\n" + json.dumps(_entry("b")) + "\n"
-    assert [e["partition"] for e in _parse_jsonl(text)] == ["a", "b"]
+    assert [e["partition"] for e in parse_jsonl(text)] == ["a", "b"]
 
 
 def test_parse_discards_a_torn_trailing_line():
     good = json.dumps(_entry("a")) + "\n" + json.dumps(_entry("b")) + "\n"
     torn = good + '{"partition": "c", "sha256": "untermin'
-    parsed = _parse_jsonl(torn)
+    parsed = parse_jsonl(torn)
     assert [e["partition"] for e in parsed] == ["a", "b"]
 
 
 def test_parse_of_empty_text_is_empty():
-    assert _parse_jsonl("") == []
+    assert parse_jsonl("") == []
 
 
 # -- last entry wins ---------------------------------------------------------
@@ -164,10 +164,11 @@ def test_manifest_and_journal_are_excluded():
     )
 
 
-def test_data_files_and_the_quarantine_ledger_are_not_excluded():
+def test_data_files_and_the_two_other_ledgers_are_not_excluded():
     assert not _is_excluded("chains/ticker=SPY/date=2026-08-24.parquet", SCRUB_EXCLUSIONS)
-    # The quarantine ledger carries its own manifest entry, so it is scrubbed, not skipped.
+    # Each of these carries its own manifest entry, so both are scrubbed, not skipped.
     assert not _is_excluded("quarantine.jsonl", SCRUB_EXCLUSIONS)
+    assert not _is_excluded("actions/corporate_actions.jsonl", SCRUB_EXCLUSIONS)
 
 
 def test_enumerated_exclusion_set_is_exactly_the_three_documented_members():

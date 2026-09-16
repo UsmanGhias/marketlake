@@ -22,6 +22,12 @@ The quarantine ledger at ``quarantine.jsonl`` follows the same three rules. It r
 data-quality verdicts per partition. Un-quarantine is a superseding entry, never a
 deletion. This module gives it the same append and read helpers.
 
+The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
+it keys on the action rather than on a path, so ``lake.actions`` resolves its own last
+entry and reuses ``append_line`` and ``parse_jsonl`` for the line rules alone. Those two
+are public for that reason: three ledgers now implement one rule, and a second copy of it
+would be a second answer to what a torn tail is.
+
 The same ledger judges the backup copy. ``backup_scrub`` walks the rsync target and
 checks it against this manifest rather than against the copy of the manifest riding on
 the backup, because the lake is the authority and a copy that rotted alongside its data
@@ -70,10 +76,10 @@ from lake.paths import (
 #    it here by name, so a subdirectory added under it needs nothing added here. None of
 #    the four is a measurement.
 #
-# The quarantine ledger is deliberately not on this list. The battery refreshes its
-# manifest entry after each run, and the sign-off tool appends the row and the refreshed
-# entry in one locked invocation. So the ledger is scrubbed like any sealed file, which
-# is the check that catches a verdict written without its entry.
+# Neither the quarantine ledger nor the corporate-actions ledger is on this list, and
+# both are off it deliberately. Each writer refreshes its own manifest entry in the same
+# locked invocation that appends the row, so both are scrubbed like any sealed file. That
+# is the check that catches a verdict, or an action, written without its entry.
 #
 # An entry ending in ``/`` is a directory prefix. Any other entry is an exact filename
 # at the lake root. The lock adds no file to skip, because it locks the manifest itself.
@@ -137,7 +143,7 @@ def sha256_file(path: Path) -> str:
 # -- reading -----------------------------------------------------------------
 
 
-def _parse_jsonl(text: str) -> list[dict]:
+def parse_jsonl(text: str) -> list[dict]:
     """Parse ledger text into entries, discarding a torn trailing line.
 
     A blank line is skipped. The first line that does not parse ends the read. By the
@@ -161,7 +167,7 @@ def _read_jsonl(path: Path) -> list[dict]:
     path = Path(path)
     if not path.exists():
         return []
-    return _parse_jsonl(path.read_text())
+    return parse_jsonl(path.read_text())
 
 
 def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]:
@@ -232,11 +238,23 @@ def is_quarantined(entry: dict | None) -> bool:
 # -- appending ---------------------------------------------------------------
 
 
-def _append_line(path: Path, entry: dict) -> None:
+def append_line(path: Path, entry: dict) -> None:
     """Append one entry as exactly one line via a single ``O_APPEND`` write.
 
     ``sort_keys`` keeps the on-disk bytes stable across callers. The line is written
     in one ``os.write`` so it cannot interleave with a concurrent append.
+
+    One write is the whole rule, so nothing here reads the file first. Starting a new line
+    when the file does not end in one was tried, to keep a torn fragment from fusing with
+    the next entry, and it broke this rule two ways. It takes a second ``os.write``, which
+    another writer can interleave with, and its check can observe a concurrent write
+    partway and insert a blank line. ``test_concurrent_appends_never_interleave`` caught
+    the second within one run. A torn fragment therefore still costs the entry appended
+    after it, and repairing one is a human's job under the lock.
+
+    This is the line primitive rather than the way to record a partition. A manifest entry
+    goes through ``append_manifest``, which enforces the standing row-count invariant
+    first.
     """
     line = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -285,7 +303,7 @@ def append_manifest(
         "rows": rows,
         "fetched_at": fetched_at,
     }
-    _append_line(manifest_path(lake_root), entry)
+    append_line(manifest_path(lake_root), entry)
     return entry
 
 
@@ -322,7 +340,7 @@ def append_quarantine(lake_root: Path, entry: dict) -> dict:
     The entry is keyed by ``partition`` like the manifest. Last entry wins, so an
     un-quarantine is a superseding row, never a deletion of history.
     """
-    _append_line(quarantine_path(lake_root), entry)
+    append_line(quarantine_path(lake_root), entry)
     return entry
 
 
@@ -590,7 +608,7 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
 
     The watermark is worth nothing unless the copy really is a prefix, so that is checked
     first, and checked over bytes rather than over parsed entries. The reason is exact.
-    ``_parse_jsonl`` discards the first line it cannot parse and every line after it, by
+    ``parse_jsonl`` discards the first line it cannot parse and every line after it, by
     the append rule that says only the last line can be torn. Rot on an SSD obeys no such
     rule. One flipped byte in the middle of the copy would discard the whole tail, the
     watermark would collapse to the rot's position, every partition past it would read as
@@ -647,9 +665,9 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
         )
 
     # A prefix split mid-character decodes with a replacement, and the line it sits in is
-    # the torn tail ``_parse_jsonl`` discards anyway.
-    source_entries = _parse_jsonl(source_bytes.decode("utf-8", "replace"))
-    backup_entries = _parse_jsonl(backup_bytes.decode("utf-8", "replace"))
+    # the torn tail ``parse_jsonl`` discards anyway.
+    source_entries = parse_jsonl(source_bytes.decode("utf-8", "replace"))
+    backup_entries = parse_jsonl(backup_bytes.decode("utf-8", "replace"))
     if not backup_entries and source_entries:
         # A watermark of zero over a lake that has entries would make every partition
         # pending and the whole scrub a no-op.
