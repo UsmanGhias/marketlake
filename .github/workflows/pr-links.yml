@@ -1,0 +1,48 @@
+name: PR links
+
+# A closing keyword the body parser rejects merges without complaint and loses the link
+# between the work and the issue that asked for it. Sixteen of this repository's first 182
+# pull requests lost or partly lost their link that way. `edited` is in the list because the
+# repair for that defect is a body edit, and a check that never re-runs after the fix leaves
+# a red mark on a pull request that is now correct. That is also why this is its own file
+# rather than a job in ci.yml, where `edited` would re-run the whole test suite on every
+# body edit.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+# ci.yml runs on `contents: read` alone, set deliberately in #14. This adds exactly one
+# scope, which is what writing the verdict onto the pull request needs.
+permissions:
+  contents: read
+  pull-requests: write
+
+# `synchronize` and `edited` can fire within a second of each other. Two runs that both find
+# no comment of their own both create one.
+concurrency:
+  group: pr-links-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  closing-links:
+    name: closing-links
+    runs-on: ubuntu-latest
+    # The job is one API read, one comment write and a regex. This ceiling only fires on a
+    # hang, and it replaces GitHub's six-hour default.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # No `uv sync`. The checker is standard library only and `gh` is preinstalled on the
+      # runner, which is what keeps this job in seconds rather than a minute.
+      - name: Compare what the body claims against what GitHub parsed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The pull request number reaches the script through the environment rather than
+          # through the shell command. Nothing from the pull request is ever interpolated
+          # into a `run:` block, which is the script injection this repository's code
+          # scanning setup flags at error level, and its ruleset blocks a merge on that.
+          # The body itself is never passed in at all: the script reads it from the same
+          # API call that returns the parse of it.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 -m tools.pr_links "$PR_NUMBER"
