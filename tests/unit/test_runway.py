@@ -632,3 +632,76 @@ def test_each_entry_reports_its_own_file_count(tmp_path: Path):
     by_name = {entry.name: entry for entry in walk(tmp_path).entries}
     assert by_name["chains"].files == 5
     assert by_name["manifest.jsonl"].files == 1
+
+
+# -- the totals accumulate, they do not overwrite -----------------------------
+
+
+def test_an_entry_sums_every_file_under_it_rather_than_keeping_the_last(tmp_path: Path):
+    """Two files under one surface must add up, and nothing was checking that they do.
+
+    Every earlier assertion about entry bytes was either a one-file entry or a
+    greater-than-zero check, so replacing the running sum with a plain assignment stayed
+    green across the whole suite. The live lake holds fifteen chain partitions under one
+    entry, so the panel's headline size would have read as the last file alone.
+    """
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 40_000)
+    _write(tmp_path, "chains/ticker=QQQ/date=2026-09-14.parquet", 30_000)
+    _write(tmp_path, "quotes/ticker=SPY/date=2026-09-14.parquet", 100)
+    by_name = {entry.name: entry for entry in walk(tmp_path).entries}
+    frsize = os.statvfs(tmp_path).f_frsize
+    # Two files of 40,000 and 30,000 bytes occupy at least their sizes and at most one
+    # block more each, so the sum is bounded on both sides and a single file cannot reach
+    # the lower bound.
+    assert by_name["chains"].bytes >= 70_000
+    assert by_name["chains"].bytes < 70_000 + 2 * frsize
+    assert by_name["chains"].files == 2
+    assert by_name["chains"].bytes > by_name["quotes"].bytes
+
+
+def test_a_day_sums_every_partition_written_for_it(tmp_path: Path):
+    """The real lake writes four to six partitions per capture day, one per ticker-surface.
+
+    A day that kept only its last file would understate the busiest day, which sets the
+    rate, which sets the runway. That is the fail-open direction, and the mutation
+    survived the whole suite.
+    """
+    for ticker, size in (("SPY", 40_000), ("QQQ", 30_000)):
+        _write(tmp_path, f"chains/ticker={ticker}/date=2026-09-14.parquet", size)
+        _write(tmp_path, f"quotes/ticker={ticker}/date=2026-09-14.parquet", 100)
+    usage = walk(tmp_path)
+    frsize = os.statvfs(tmp_path).f_frsize
+    day = usage.day_bytes[date(2026, 9, 14)]
+    assert day >= 70_200
+    assert day < 70_200 + 4 * frsize
+    assert usage.files == 4
+    assert usage.dated == day
+
+
+# -- a symlink cannot import bytes from outside the lake ----------------------
+
+
+def test_a_symlink_counts_itself_and_never_what_it_points_at(tmp_path: Path):
+    """The sandbox's premise is that nothing outside ``lake_root`` reaches the panel.
+
+    A symlink inside the lake pointing at a large file outside it would otherwise add that
+    file's bytes to the lake's size and to the growth rate, which is the one thing the
+    surrounding design says cannot happen. ``os.walk`` does not descend a symlinked
+    directory and ``stat(follow_symlinks=False)`` measures the link rather than its target.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    big = outside / "big.parquet"
+    big.write_bytes(b"x" * 200_000)
+    lake = tmp_path / "lake"
+    _write(lake, "chains/ticker=SPY/date=2026-09-14.parquet", 100)
+    (lake / "chains" / "ticker=SPY" / "date=2026-09-15.parquet").symlink_to(big)
+    (lake / "linked-tree").symlink_to(outside, target_is_directory=True)
+
+    usage = walk(lake)
+    frsize = os.statvfs(tmp_path).f_frsize
+    # One real file, plus a symlink that occupies no data blocks of its own.
+    assert usage.total < 200_000
+    assert usage.total <= 2 * frsize
+    # The symlinked directory is not descended, so it contributes no entry at all.
+    assert {entry.name for entry in usage.entries} == {"chains"}
