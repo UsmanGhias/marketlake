@@ -11,6 +11,9 @@ reads ``None``. Marketlake #415 carries that fragility.
 from __future__ import annotations
 
 import json
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -61,6 +64,7 @@ from lake.battery import (
     sealed_partitions,
     session_snapshot_counts,
     trailing_medians,
+    write_verdict,
 )
 from lake.capture_spans import CaptureSpan
 from lake.config import GuardConstants
@@ -426,6 +430,345 @@ def test_the_run_leaves_a_human_sign_off_standing_and_says_so(lake: Path):
     assert report.appended == ()
     assert read_quarantine(lake) == before
     assert any("human precedence stands" in line for line in report.report)
+
+
+# -- the ledger read and the lock --------------------------------------------
+
+
+def _quarantined_then_fixed(root: Path, *, staleness: float = -1.7) -> None:
+    """A lake whose partition one run quarantined and whose feed is fixed by the next.
+
+    That is the state both races below need. The entitlement check fails on night one, so the
+    ledger carries ``quarantined``/battery, and re-sealing the partition with the live lake's
+    own skew is what makes the next night's check pass and therefore transition.
+    """
+    _write(root, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(root)
+    judge(root, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+    _write(root, "chains", "SPY", DAY, _clean_rows("chains", staleness=staleness))
+
+
+def _human(root: Path, verdict: str) -> dict:
+    """The entry ``lake.signoff`` writes, landed through the writer a caller inside the lock
+    uses. Built here rather than by calling ``signoff``, because these seams run inside the
+    hold and that tool takes the lock itself."""
+    return write_verdict(
+        root,
+        build_entry(
+            partition=JUDGED,
+            verdict=verdict,
+            check=CHECK_ENTITLEMENT,
+            observed_at=NOW,
+            provenance=PROVENANCE_HUMAN,
+            reason="vendor confirmed the delay was theirs",
+        ),
+        observed_at=NOW,
+    )
+
+
+@contextmanager
+def _signing_off(verdict: str, *, on: str = "acquire"):
+    """A ``lake_lock`` that lands a human entry as the hold is taken, or as it is released.
+
+    The pattern is ``test_occ_mapping``'s ``racing_lock``. ``on="acquire"`` puts the write in
+    the window a read taken before the walk cannot see, so a read left outside the hold uses
+    the stale snapshot. ``on="release"`` puts it in the window between one hold and the next,
+    which is the shape a writer blocked on the lock actually lands in: it waits, and the
+    kernel hands it the lock the instant the holder lets go.
+
+    The pair is what separates a read under *a* lock from a read under *the* lock the append
+    happens in. Splitting the two into one hold for the read and another for the append passes
+    every ``on="acquire"`` assertion, because the human entry still lands before the read.
+    Found by the mutation lens on marketlake #479.
+
+    ``judge`` imports the lock inside the function, so patching the module attribute is what
+    the call resolves against. The entry goes in through ``write_verdict`` rather than through
+    ``signoff``, because this code already holds the lock and that tool takes it.
+    """
+    from lake.lock import lake_lock as real_lock
+
+    landed: list[dict] = []
+    holds: list[int] = []
+
+    @contextmanager
+    def racing_lock(lake_root):
+        holds.append(1)
+        with real_lock(lake_root) as held:
+            if on == "acquire" and not landed:
+                landed.append(_human(Path(lake_root), verdict))
+            try:
+                yield held
+            finally:
+                if on == "release" and not landed:
+                    landed.append(_human(Path(lake_root), verdict))
+
+    yield racing_lock, landed, holds
+
+
+def test_the_ledger_is_read_inside_the_lock_the_verdict_is_appended_under(lake: Path, monkeypatch):
+    """Marketlake #470. The walk's own snapshot is as old as the walk.
+
+    Read once before the walk, a sign-off landing during it is invisible to
+    ``human_precedence``, and the battery appends its own ``clean`` after the human's. Nothing
+    looks wrong that night, because both say the partition reads. The cost lands on the first
+    later night the check fails: the entry the rule compares carries ``provenance: battery``,
+    so the run re-quarantines what a person cleared on purpose.
+    """
+    _quarantined_then_fixed(lake)
+
+    with _signing_off(CLEAN_VERDICT) as (racing_lock, landed, _holds):
+        monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
+        report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert landed, "the seam never fired, so this test proves nothing"
+    assert report.deferred == 1
+    assert report.appended == ()
+    assert read_quarantine(lake)[-1]["provenance"] == PROVENANCE_HUMAN
+    assert latest_quarantine(lake)[JUDGED]["provenance"] == PROVENANCE_HUMAN
+    assert any("human precedence stands" in line for line in report.report)
+
+
+def test_the_append_happens_in_the_same_hold_as_the_read_and_not_a_second_one(
+    lake: Path, monkeypatch
+):
+    """Reading under *a* lock is not reading under *the* lock the append happens in.
+
+    Splitting the two, one hold to read and the public locking writer for the append, is the
+    plausible refactor: it keeps the per-partition read, keeps it locked, and removes the
+    re-entrancy hazard, so it looks safer. It reinstates marketlake #470 at a narrower window.
+    A sign-off blocked on the lock lands the instant the reader lets go, which is before the
+    append rather than after it, and the battery's own line buries it exactly as before.
+
+    Every assertion that lands its write on acquisition passes under that refactor, because
+    the human entry still precedes the read. This one lands on release, and counts the holds,
+    which is the other way to say the same thing.
+    """
+    _quarantined_then_fixed(lake)
+
+    with _signing_off(CLEAN_VERDICT, on="release") as (racing_lock, landed, holds):
+        monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
+        judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert landed, "the seam never fired, so this test proves nothing"
+    assert latest_quarantine(lake)[JUDGED]["provenance"] == PROVENANCE_HUMAN, (
+        "the battery's own line landed after the sign-off, so the next run that fails this "
+        "check will re-quarantine what a person cleared"
+    )
+    assert read_quarantine(lake)[-1]["provenance"] == PROVENANCE_HUMAN
+    # One hold for the partition, covering its read and its appends together. Two holds is
+    # the refactor above, whatever order they are written in.
+    assert holds == [1], f"judge took {len(holds)} holds for one partition, not one"
+
+
+def test_a_sign_off_landing_mid_walk_leaves_what_one_landing_before_it_leaves(
+    tmp_path: Path, monkeypatch
+):
+    """The invariant the fix is for, stated as a pair rather than as a property of one run.
+
+    Two lakes built the same way and one sign-off, differing only in whether it lands before
+    the walk or inside it. The ledgers and the counts have to match, on the night it lands and
+    on the night after, when the feed is delayed again and the precedence rule is what decides
+    whether the partition is re-quarantined.
+    """
+
+    def run(root: Path, *, mid_walk: bool) -> tuple[list[dict], list[tuple]]:
+        root.mkdir()
+        (root / "manifest.jsonl").write_text("")
+        _quarantined_then_fixed(root)
+        counts: list[tuple] = []
+        if mid_walk:
+            with _signing_off(CLEAN_VERDICT) as (racing_lock, landed, _holds):
+                monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
+                night_two = judge(root, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+                assert landed, "the seam never fired, so this half proves nothing"
+            monkeypatch.undo()
+        else:
+            _human(root, CLEAN_VERDICT)
+            night_two = judge(root, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+        counts.append((night_two.deferred, night_two.released, night_two.appended))
+
+        # The feed is delayed again, which is when a lost sign-off costs something.
+        _write(root, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+        night_three = judge(root, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+        counts.append((night_three.deferred, night_three.released, night_three.appended))
+        return read_quarantine(root), counts
+
+    raced, raced_counts = run(tmp_path / "raced", mid_walk=True)
+    calm, calm_counts = run(tmp_path / "calm", mid_walk=False)
+
+    assert raced == calm
+    assert raced_counts == calm_counts
+    assert [entry["provenance"] for entry in raced] == [PROVENANCE_BATTERY, PROVENANCE_HUMAN]
+    assert is_quarantined(latest_quarantine(tmp_path / "raced")[JUDGED]) is False
+
+
+def test_a_revoke_landing_mid_walk_is_not_superseded_by_the_runs_own_verdict(
+    lake: Path, monkeypatch
+):
+    """The other direction, which the ledger reaches by a different route.
+
+    A human revoking a sign-off writes ``quarantined``/human. Where the battery's stale entry
+    is its own ``clean`` and the check now fails, the transition test passes against that stale
+    entry and the run appends ``quarantined``/battery after the human's line. Both withhold the
+    partition, so again nothing looks wrong, and again the provenance the precedence rule reads
+    is the battery's. Without the second direction a mistaken sign-off is permanent, which is
+    why ``lake.signoff`` has it at all.
+    """
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-1.7))
+    _seed_spans(lake)
+    judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+    append_verdict(
+        lake,
+        build_entry(
+            partition=JUDGED, verdict=CLEAN_VERDICT, check=CHECK_ENTITLEMENT, observed_at=NOW
+        ),
+        observed_at=NOW,
+    )
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+
+    with _signing_off(QUARANTINED_VERDICT) as (racing_lock, landed, _holds):
+        monkeypatch.setattr("lake.lock.lake_lock", racing_lock)
+        report = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert landed, "the seam never fired, so this test proves nothing"
+    assert report.deferred == 1
+    assert report.appended == ()
+    assert latest_quarantine(lake)[JUDGED]["provenance"] == PROVENANCE_HUMAN
+    assert is_quarantined(latest_quarantine(lake)[JUDGED]) is True
+
+
+def test_a_second_run_overlapping_the_first_appends_one_line_and_not_two(lake: Path, monkeypatch):
+    """``python -m lake.battery`` is a hand run and the 18:30 sweep runs the same walk.
+
+    Nothing schedules the two apart, so a hand run started while the nightly one is walking is
+    an ordinary shape. With each run's ledger read taken before its walk, both see no entry,
+    both call it a transition, and the identical line lands twice. That breaks the
+    append-on-transition rule: a check whose current entry already says what this finding says
+    is the same news a second time.
+    """
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(lake)
+
+    from lake import battery as module
+
+    original = module._judge_partition
+    overlapped: list[BatteryReport] = []
+
+    def hooked(*args, **kwargs):
+        if not overlapped:
+            # The second run is an ordinary walk, started inside the first one's.
+            monkeypatch.setattr(module, "_judge_partition", original)
+            overlapped.append(judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants()))
+            monkeypatch.setattr(module, "_judge_partition", hooked)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_judge_partition", hooked)
+    first = judge(lake, calendar=CALENDAR, now=NOW, guards=GuardConstants())
+
+    assert overlapped, "the seam never fired, so this test proves nothing"
+    assert len(overlapped[0].appended) == 1
+    assert first.appended == ()
+    assert len(read_quarantine(lake)) == 1
+
+
+def test_append_verdict_still_writes_to_a_lake_root_that_does_not_exist_yet(tmp_path: Path):
+    """The directory has to be made before the lock, because the lock cannot make it.
+
+    ``lake_lock`` opens ``manifest.jsonl`` with ``O_CREAT``, which creates the file and never
+    the directory holding it. Moving the ``mkdir`` inside the hold, where the writes are, turns
+    the acquire into a ``FileNotFoundError`` on a root nothing has created. Caught by the
+    correctness review on marketlake #479 rather than by any existing test, because every
+    other caller reaches this function with the root already on disk.
+    """
+    root = tmp_path / "absent"
+
+    append_verdict(
+        root,
+        build_entry(
+            partition=JUDGED,
+            verdict=QUARANTINED_VERDICT,
+            check=CHECK_ENTITLEMENT,
+            observed_at=NOW,
+        ),
+        observed_at=NOW,
+    )
+
+    assert [entry["check"] for entry in read_quarantine(root)] == [CHECK_ENTITLEMENT]
+    assert (root / "manifest.jsonl").exists()
+
+
+def test_a_dry_run_creates_no_manifest_in_a_lake_that_has_none(tmp_path: Path):
+    """A preview writes nothing at all, and taking the lock would break that.
+
+    ``lake_lock`` creates ``manifest.jsonl`` on acquire, so a dry run holding it writes a file
+    into a lake root that had none. ``test_a_dry_run_writes_no_line_and_sends_no_page`` cannot
+    see this, because the ``lake`` fixture creates the manifest itself, which is why this one
+    builds its root by hand.
+    """
+    root = tmp_path / "lake"
+    root.mkdir()
+    _write(root, "chains", "SPY", DAY, _clean_rows("chains", staleness=900.0))
+    _seed_spans(root)
+    assert not (root / "manifest.jsonl").exists()
+
+    report = judge(root, calendar=CALENDAR, now=NOW, guards=GuardConstants(), dry_run=True)
+
+    assert report.quarantined == 1, "the walk has to reach the check for this to prove anything"
+    assert not (root / "manifest.jsonl").exists()
+    assert not (root / "quarantine.jsonl").exists()
+
+
+def test_append_verdict_takes_the_lock_and_write_verdict_leaves_it_to_its_caller(lake: Path):
+    """The two levels the split created, asserted against the real lock rather than by reading.
+
+    ``lake_lock`` is a blocking exclusive ``flock`` with no reentrancy, so the one that takes
+    it blocks while this test holds it and the one that does not lands both writes straight
+    away. The pattern is ``test_actions``'s. Getting this backwards is what would deadlock
+    ``judge``, which calls the second from inside its own hold.
+    """
+    from lake.lock import lake_lock
+
+    entry = build_entry(
+        partition=JUDGED, verdict=QUARANTINED_VERDICT, check=CHECK_ENTITLEMENT, observed_at=NOW
+    )
+    failures: list[BaseException] = []
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            append_verdict(lake, entry, observed_at=NOW)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread below
+            failures.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=run)
+    with lake_lock(lake):
+        worker.start()
+        # Long enough for the worker to reach the lock and block on it.
+        time.sleep(0.3)
+        assert read_quarantine(lake) == []
+        assert not done.is_set()
+        # The unlocked half writes the pair without asking for a lock this thread holds.
+        write_verdict(
+            lake,
+            build_entry(
+                partition=JUDGED,
+                verdict=QUARANTINED_VERDICT,
+                check=CHECK_QUOTE_SANITY,
+                observed_at=NOW,
+            ),
+            observed_at=NOW,
+        )
+        assert [one["check"] for one in read_quarantine(lake)] == [CHECK_QUOTE_SANITY]
+
+    assert done.wait(10)
+    worker.join(10)
+    assert failures == []
+    assert [one["check"] for one in read_quarantine(lake)] == [
+        CHECK_QUOTE_SANITY,
+        CHECK_ENTITLEMENT,
+    ]
 
 
 # -- append on transition ----------------------------------------------------
