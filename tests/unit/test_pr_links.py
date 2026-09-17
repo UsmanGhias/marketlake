@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 
 import pytest
@@ -674,20 +675,42 @@ def test_parsed_numbers_matches_a_repository_in_another_case() -> None:
 # ---------------------------------------------------------------------------
 
 BLOWUP = [
-    ("Closes" + " " * 20000 + "and then prose.", "a long run of spaces reaching no reference"),
-    ("Closes" + "\t" * 20000 + "and then prose.", "tabs"),
-    ("Closes" + "[" * 5000 + " none", "a run of brackets"),
-    ("Closes" + "`(*_[" * 2000 + " none", "mixed decoration"),
-    ("Closes " + ":" * 5000 + " none", "colons"),
-    ("Part of" + " " * 20000 + "prose.", "the same shape on the Part of pattern"),
+    ("Closes" + " " * 400 + "and then prose.", "a run of spaces reaching no reference"),
+    ("Closes" + "\t" * 400 + "and then prose.", "tabs"),
+    ("Closes" + "[" * 400 + " none", "a run of brackets"),
+    ("Closes" + "`(*_[" * 200 + " none", "mixed decoration"),
+    ("Closes " + ":" * 400 + " none", "colons"),
+    ("Part of" + " " * 400 + "prose.", "the same shape on the Part of pattern"),
 ]
 
 
 @pytest.mark.parametrize("body,why", BLOWUP, ids=[w for _, w in BLOWUP])
 def test_the_scan_stays_linear(body: str, why: str) -> None:
+    """Four hundred characters, not four thousand, and that size is the point.
+
+    The cubic version took 0.856s on 400 characters and 22.7s on 1,200, so this size fails
+    fast under a regression while a linear scan finishes in tens of microseconds. Feeding it
+    a realistic 20,000 does not make the test stronger, it makes it **hang** rather than
+    fail, and a hanging test burns the job's timeout instead of reporting anything. The
+    production-scale guarantee is held by the subprocess test below, which cannot hang
+    because it is killed.
+    """
     started = time.perf_counter()
     assert scan(body, REPO).closes == frozenset()
-    assert time.perf_counter() - started < 1.0, why
+    assert time.perf_counter() - started < 0.25, why
+
+
+def test_the_scan_survives_a_body_at_github_s_size_limit() -> None:
+    """A full-size hostile body, run where a hang is a failure rather than a wait.
+
+    `re` does not check for signals while matching, so a catastrophic backtrack cannot be
+    interrupted in process. A subprocess can be killed, which is what makes this assertion
+    possible at all.
+    """
+    program = (
+        "from tools.pr_links import scan;scan('Closes' + ' ' * 65000 + 'prose', 'l3a0/marketlake')"
+    )
+    subprocess.run([sys.executable, "-c", program], timeout=10, check=True, capture_output=True)
 
 
 def test_a_qualified_reference_inside_a_markdown_link_still_reads() -> None:
