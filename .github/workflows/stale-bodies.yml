@@ -22,7 +22,11 @@ concurrency:
   # Two pushes in quick succession would otherwise have two runs each find no marker
   # comment and each post one, which is the papering failure on a single pull request.
   group: stale-bodies-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # A merge run is never cancelled and never cancels: it queues behind whatever is in
+  # flight instead. A cancelled run is neutral rather than red, so losing the merge run
+  # would lose the comment with nothing marking its absence, which is the silent failure
+  # this whole check exists to prevent.
+  cancel-in-progress: ${{ github.event.action != 'closed' }}
 
 jobs:
   candidates:
@@ -55,8 +59,15 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
-          if [ "$PR_ACTION" = "closed" ]; then
-            if [ "$PR_MERGED" = "true" ]; then state=merged; else state=abandoned; fi
+          # Read merged before action. An "edited" event on an already merged pull
+          # request carries action=edited and merged=true, and deriving the state from
+          # the action alone would call it open, rewrite the comment to its pre-merge
+          # wording, and recompute the list against a tracker that has moved. Four of the
+          # last sixty merges here had their body edited after merging.
+          if [ "$PR_MERGED" = "true" ]; then
+            state=merged
+          elif [ "$PR_ACTION" = "closed" ]; then
+            state=abandoned
           else
             state=open
           fi

@@ -35,6 +35,7 @@ project.
 ## Layout
 
 Production code lives under `src/lake`. Tests and their fakes live under `tests`.
+Repository tooling that runs in CI, and ships in no wheel, lives under `tools`.
 
 - `src/lake/clock.py` is the clock module. It is the one place in production code
   that reads wall-clock time.

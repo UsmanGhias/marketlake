@@ -33,7 +33,13 @@ addopts = "-ra"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["src", "tests", "."]
+src = ["src", "tests"]
+
+[tool.ruff.lint.isort]
+# ``tools`` is repository tooling at the root, so ruff would sort it as a third-party
+# import. Naming it here is narrower than adding "." to ``src`` above, which would make
+# every top-level directory first-party, including one whose name shadowed a dependency.
+known-first-party = ["tools"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

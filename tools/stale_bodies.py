@@ -38,10 +38,16 @@ __all__ = [
 
 MARKER = "<!-- stale-body-candidates -->"
 
-# A bare ``#123``. The lookbehind drops ``actions/checkout#2454``, the foreign form that
-# 45 of this repo's 46 such references take, all inside one Dependabot body. It also
-# drops ``l3a0/marketlake#58``, which is real, so _SELF below puts that one back.
-_HASH = re.compile(r"(?<![\w/-])#(\d+)\b")
+# A bare ``#123``. The lookbehind drops a foreign slug such as ``actions/checkout#2454``,
+# because the character before the hash is a word character. It also drops
+# ``l3a0/marketlake#58``, which is real, so _self_pattern puts that one back.
+#
+# It is ``\w`` alone on purpose. Adding ``/`` and ``-`` to the class looked free and is
+# not: across all 425 bodies in this repo, 49 hashes follow a word character and every one
+# is a slug, none follows a slash, and the one that follows a hyphen is a real reference,
+# #194's "The pre-#184 behaviour stays". Those two characters bought nothing and cost a
+# reference, and would also drop the second half of a range written ``#392-#393``.
+_HASH = re.compile(r"(?<!\w)#(\d+)\b")
 
 # Reference forms this repo does not use, and the reason each is left unmatched, are in
 # #393: ``pull/NNN`` URLs are safe to ignore because issues and pull requests share one
@@ -101,8 +107,9 @@ def candidates(
     """
     closing = set(closes)
     named = references(pull_body, repo) - closing
+    rows = list(issues)  # read twice below, so a generator would blank every title
     found: dict[int, list[str]] = {}
-    for issue in issues:
+    for issue in rows:
         number = int(issue["number"])  # type: ignore[arg-type]
         if number in closing:
             continue
@@ -117,7 +124,7 @@ def candidates(
             reasons.append(f"cites {joined}, which this closes")
         if reasons:
             found[number] = reasons
-    titles = {int(i["number"]): str(i.get("title", "")) for i in issues}  # type: ignore[arg-type]
+    titles = {int(i["number"]): str(i.get("title", "")) for i in rows}  # type: ignore[arg-type]
     return [
         Candidate(number=n, title=titles.get(n, ""), reasons=tuple(found[n]))
         for n in sorted(found, reverse=True)
@@ -169,8 +176,19 @@ def render(found: Sequence[Candidate], *, state: str) -> str | None:
     return "\n".join(lines)
 
 
+def _json(raw: str, what: str) -> object:
+    """Parse a ``gh`` reply, or refuse in one line rather than raising a decode error."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise StaleBodiesError(f"{what} did not come back as JSON: {error}") from None
+
+
 def _gh(args: Sequence[str]) -> str:
-    result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise StaleBodiesError(f"gh could not be run: {error}") from None
     if result.returncode != 0:
         detail = result.stderr.strip().splitlines()
         tail = detail[-1] if detail else f"exit {result.returncode}"
@@ -178,11 +196,29 @@ def _gh(args: Sequence[str]) -> str:
     return result.stdout
 
 
+def _slug_of(ref: object) -> str:
+    """The ``owner/name`` a closing reference belongs to, or an empty string."""
+    if not isinstance(ref, dict):
+        return ""
+    repository = ref.get("repository")
+    if not isinstance(repository, dict):
+        return ""
+    owner = repository.get("owner")
+    login = owner.get("login") if isinstance(owner, dict) else None
+    return f"{login}/{repository.get('name')}" if login else ""
+
+
 def _fetch_closes(repo: str, number: int) -> list[int]:
-    """What GitHub parsed as this pull request's closing references.
+    """What GitHub parsed as this pull request's closing references, in this repository.
 
     The webhook payload cannot supply this. ``gh api repos/<repo>/pulls/<n>`` carries no
     closing-reference key, because the field is GraphQL only.
+
+    The reply names each reference's repository, and a reference in another one is
+    discarded. Taking its bare number would read it as a local issue, which would exclude
+    the wrong issue from the candidates and name every issue citing that number. The
+    matcher already refuses a foreign slug in a body, so accepting one here would be the
+    same decision made two different ways.
     """
     raw = _gh(
         [
@@ -192,11 +228,17 @@ def _fetch_closes(repo: str, number: int) -> list[int]:
             "--repo",
             repo,
             "--json",
-            "closingIssuesReferences",
+            "closingIssuesReferences",  # each entry carries its own repository
         ]
     )
-    payload = json.loads(raw)
-    return [int(ref["number"]) for ref in payload.get("closingIssuesReferences", [])]
+    payload = _json(raw, "the closing references")
+    if not isinstance(payload, dict):
+        raise StaleBodiesError("the closing references came back in an unreadable shape")
+    return [
+        int(ref["number"])
+        for ref in payload.get("closingIssuesReferences", [])
+        if _slug_of(ref) == repo
+    ]
 
 
 _LIMIT = 2000
@@ -217,7 +259,10 @@ def _list_open_issues(repo: str) -> list[dict[str, object]]:
             "number,title,body,state",
         ]
     )
-    return list(json.loads(raw))
+    listing = _json(raw, "the open-issue listing")
+    if not isinstance(listing, list):
+        raise StaleBodiesError("the open-issue listing came back in an unreadable shape")
+    return listing
 
 
 def _count_open_issues(repo: str) -> int:
@@ -227,19 +272,23 @@ def _count_open_issues(repo: str) -> int:
         f"{{repository(owner:{owner_literal},name:{name_literal})"
         "{issues(states:OPEN){totalCount}}}"
     )
-    total = json.loads(_gh(["api", "graphql", "-f", f"query={query}"]))
-    return int(total["data"]["repository"]["issues"]["totalCount"])
+    total = _json(_gh(["api", "graphql", "-f", f"query={query}"]), "the open-issue count")
+    try:
+        return int(total["data"]["repository"]["issues"]["totalCount"])  # type: ignore[index]
+    except (KeyError, TypeError, ValueError):
+        raise StaleBodiesError("the open-issue count came back in an unreadable shape") from None
 
 
 def _fetch_open_issues(repo: str) -> list[dict[str, object]]:
     """Every open issue, or a refusal.
 
     A short list is the failure this module exists to prevent, arriving from inside the
-    module, so the count is checked twice. Against the limit, which catches a cap:
-    ``gh issue list --limit 5`` returns five and says nothing about the rest. And against
-    ``totalCount``, which catches a short page.
+    module. ``gh issue list --limit 5`` returns five and says nothing about the rest, so
+    the returned count is set against ``totalCount``. A listing capped at ``_LIMIT`` is
+    caught by the same comparison, since a cap can only bite when more issues are open
+    than came back, so it needs no branch of its own.
 
-    The second check races, and the race is not hypothetical. This module's own first run
+    That check races, and the race is not hypothetical. This module's own first run
     refused with "returned 111 of 112" because another session filed an issue between the
     listing and the count. A guard that refuses whenever somebody files an issue is a
     guard whose reader turns it off, which is the failure this whole module is built
@@ -250,11 +299,6 @@ def _fetch_open_issues(repo: str) -> list[dict[str, object]]:
     shortfall = ""
     for _ in range(2):
         issues = _list_open_issues(repo)
-        if len(issues) >= _LIMIT:
-            raise StaleBodiesError(
-                f"the open-issue listing hit its {_LIMIT} limit, so it is truncated and "
-                "would drop candidates silently"
-            )
         expected = _count_open_issues(repo)
         if len(issues) >= expected:
             return issues
@@ -283,14 +327,24 @@ def _find_marker_comment(repo: str, number: int) -> int | None:
     for line in raw.splitlines():
         if not line.strip():
             continue
-        comment = json.loads(line)
+        parsed = _json(line, "a pull request comment")
+        comment = parsed if isinstance(parsed, dict) else {}
         if MARKER in (comment.get("body") or ""):
             return int(comment["id"])
     return None
 
 
-def _upsert(repo: str, number: int, body: str | None) -> str:
+def _upsert(repo: str, number: int, body: str | None, *, correction_only: bool = False) -> str:
+    """Write the comment, or correct the one already there, or write nothing.
+
+    ``correction_only`` says this text exists to correct a list already posted. With no
+    such list there is nothing to correct, so nothing is written. A pull request closed
+    without merging is the case: telling a reader that nothing happened, on a pull request
+    where the check never spoke, is the empty note this module exists to avoid.
+    """
     existing = _find_marker_comment(repo, number)
+    if correction_only and existing is None:
+        return "nothing was posted, so there is nothing to correct"
     if body is None:
         if existing is None:
             return "nothing to say, and no comment to correct"
@@ -350,8 +404,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             pull_body = None
             if args.body_file:
-                with open(args.body_file, encoding="utf-8") as handle:
-                    pull_body = handle.read()
+                try:
+                    with open(args.body_file, encoding="utf-8") as handle:
+                        pull_body = handle.read()
+                except OSError as error:
+                    raise StaleBodiesError(
+                        f"the pull request body file could not be read: {error}"
+                    ) from None
             closes = _fetch_closes(args.repo, args.pull)
             issues = _fetch_open_issues(args.repo)
             found = candidates(pull_body=pull_body, closes=closes, issues=issues, repo=args.repo)
@@ -359,7 +418,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(body if body is not None else "stale_bodies: nothing to re-read")
             return 0
-        print(f"stale_bodies: {_upsert(args.repo, args.pull, body)}")
+        written = _upsert(args.repo, args.pull, body, correction_only=args.state == "abandoned")
+        print(f"stale_bodies: {written}")
     except StaleBodiesError as error:
         print(f"stale_bodies: {error}", file=sys.stderr)
         return 1
