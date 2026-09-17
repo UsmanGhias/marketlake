@@ -2619,8 +2619,8 @@ def test_an_open_quarantine_is_listed_with_its_verdict(fixture_lake: FixtureLake
         }
     ]
     assert payload["quarantine_unreadable"] is None
-    # The sign-off runs marketlake #139, which is unbuilt and is authoritative for the
-    # entry's shape. A command printed here would invent an interface on its behalf.
+    # The sign-off runs ``lake.signoff``, shipped by marketlake #139. The panel still
+    # prints no command, and marketlake #445 carries it.
     assert set(payload["quarantines"][0]) == {"partition", "verdict", "checks"}
 
 
