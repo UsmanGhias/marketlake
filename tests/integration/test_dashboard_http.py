@@ -139,7 +139,6 @@ def test_the_server_binds_the_loopback_address(served):
         "/api/today?date=2026-08-24",
         "/api/history",
         "/api/lake",
-        "/api/lake",
         "/nope",
     ],
 )

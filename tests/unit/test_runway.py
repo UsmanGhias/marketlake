@@ -357,3 +357,133 @@ def test_the_usage_total_is_its_two_halves(tmp_path: Path):
         refused=0,
     )
     assert usage.total == 12
+
+
+# -- the band between a full disk and one day's headroom ---------------------
+
+
+@pytest.mark.parametrize("free", [0, 1, 2047])
+def test_a_disk_with_under_one_day_left_exhausts_today_and_reads_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, free: int
+):
+    """The alarm's whole reason to exist, and it was inverted here.
+
+    ``free // peak`` truncates every reading below one day's growth to zero, so a full
+    disk and a nearly full one both arrive as ``capture_days_left == 0``. A forward walk
+    looking for that zero steps past it on its first session, runs out its bound, and
+    returns no date. No date reads as a runway too long to put a date on, which is the
+    opposite of the truth, and ``short`` came back false on a disk with no room left.
+    """
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _stub_space(monkeypatch, free=free)
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
+    assert result.capture_days_left == 0
+    assert result.exhausts_on == MONDAY
+    assert result.beyond_horizon is False
+    assert result.short is True
+
+
+def test_one_day_of_headroom_still_lands_on_the_next_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The other side of the boundary above, so the zero case cannot be "fixed" by a change
+    # that also collapses one day into today.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    calendar = _weekday_calendar(MONDAY, 400)
+    _stub_space(monkeypatch, free=0)
+    peak = assess(tmp_path, today=MONDAY, calendar=calendar).peak
+    _stub_space(monkeypatch, free=peak)
+    result = assess(tmp_path, today=MONDAY, calendar=calendar)
+    assert result.capture_days_left == 1
+    assert result.exhausts_on == MONDAY + timedelta(days=1)
+
+
+# -- the window's edges ------------------------------------------------------
+
+
+def test_the_window_includes_its_first_day_and_excludes_the_one_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Both edges, because a slip at either moves the runway by three orders of magnitude.
+
+    The window is ``window_days`` wide with both ends inside it, so for a 30-day window
+    ending on ``today`` the first day is ``today - 29``. A day parked on that boundary
+    sets the rate. The same day one earlier does not.
+    """
+    today = date(2026, 9, 17)
+    first = today - timedelta(days=29)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 10)
+    _write(tmp_path, f"chains/ticker=QQQ/date={first}.parquet", 400_000)
+    _stub_space(monkeypatch, free=1 << 40)
+    on_edge = assess(tmp_path, today=today, calendar=_weekday_calendar(MONDAY, 400))
+    assert on_edge.peak_day == first
+    assert on_edge.window_start == first
+
+    (tmp_path / "chains" / "ticker=QQQ" / f"date={first}.parquet").rename(
+        tmp_path / "chains" / "ticker=QQQ" / f"date={first - timedelta(days=1)}.parquet"
+    )
+    outside = assess(tmp_path, today=today, calendar=_weekday_calendar(MONDAY, 400))
+    assert outside.peak_day == date(2026, 9, 16)
+
+
+def test_the_window_excludes_a_day_after_today(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # A clock skew or a hand-written partition can date a file ahead of the session date.
+    # It is not growth that has happened, so it must not set the rate.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 10)
+    _write(tmp_path, "chains/ticker=QQQ/date=2026-09-30.parquet", 400_000)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
+    assert result.peak_day == date(2026, 9, 16)
+
+
+# -- the block multiplier, against ground truth ------------------------------
+
+
+def test_the_block_multiplier_is_checked_against_the_filesystem_not_itself(tmp_path: Path):
+    """A ground-truth bound on the multiplier, rather than the constant on both sides.
+
+    An assertion that reads ``BLOCK_BYTES`` to compute its own expectation is true for any
+    value the constant holds, so it pins nothing. The filesystem's own figures do pin it:
+    one file's allocated bytes must be at least its size and less than one block past it,
+    rounded up to ``f_frsize``. A doubled multiplier breaks that bound.
+    """
+    size = 5000
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", size)
+    usage = walk(tmp_path)
+    frsize = os.statvfs(tmp_path).f_frsize
+    assert usage.total >= size
+    assert usage.total < size + frsize
+    # And the multiplier itself, stated once rather than derived from the constant.
+    assert runway.BLOCK_BYTES == 512
+
+
+# -- what a refusal is allowed to say ----------------------------------------
+
+
+def test_a_refusal_names_a_lake_relative_path_and_never_an_absolute_one(tmp_path: Path):
+    """The dashboard publishes these strings, so a path in one is a disclosure.
+
+    ``tests/integration/test_dashboard_http.py`` states the invariant: no response carries
+    a path or a secret. A reader who can reach the port but cannot read the filesystem
+    must not learn where the lake sits on disk.
+    """
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    locked = tmp_path / "quotes"
+    _write(tmp_path, "quotes/ticker=SPY/date=2026-09-14.parquet", 10)
+    locked.chmod(0o000)
+    try:
+        usage = walk(tmp_path)
+    finally:
+        locked.chmod(0o755)
+    assert usage.refusals == ("quotes: PermissionError",)
+    for refusal in usage.refusals:
+        assert str(tmp_path) not in refusal
+        assert not refusal.startswith("/")
+
+
+def test_a_missing_root_names_the_root_rather_than_its_absolute_path(tmp_path: Path):
+    # The one refusal whose path is the root itself. Relative to itself it is "." , which
+    # tells a reader nothing, so it is named in words.
+    usage = walk(tmp_path / "not-a-lake")
+    assert usage.refusals == ("the lake root: FileNotFoundError",)
+    assert str(tmp_path) not in usage.refusals[0]

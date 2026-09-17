@@ -51,8 +51,10 @@ The Lake panel adds a fourth such read and is the one panel that reports somethi
 outside ``lake_root`` at all: the device's free space. That reading cannot go through
 DuckDB, because rule 4's sandbox refuses every path outside the root. It goes through
 ``lake.runway``, which walks the tree and calls ``shutil.disk_usage``, and the sandbox is
-untouched by it. Nothing about rule 4 is relaxed. What the panel reports from outside the
-root is one integer, and no path outside the root is ever opened.
+untouched by it. Nothing about rule 4 is relaxed. What crosses that boundary is two
+integers, the device's free bytes and its capacity, and no path outside the root is ever
+opened. A refused path is named relative to the root for the same reason, so a reader who
+cannot read the filesystem does not learn where the lake sits on disk.
 
 Three terms recur, glossed at first use.
 
@@ -2433,6 +2435,8 @@ __all__ = [
     "make_server",
     "open_lake_connection",
     "parse_date",
+    "query_history",
+    "query_lake",
     "query_now",
     "query_today",
     "session_slots",

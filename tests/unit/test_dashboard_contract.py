@@ -141,7 +141,7 @@ def test_host_allowed(host: str | None, allowed: bool):
 # -- the registry and the routes ---------------------------------------------
 
 
-def test_the_registry_is_exactly_the_three_panels():
+def test_the_registry_is_exactly_the_four_panels():
     assert set(NAMED_QUERIES) == {"now", "today", "history", "lake"}
     assert NAMED_QUERIES["now"].parameters == frozenset()
     assert NAMED_QUERIES["today"].parameters == frozenset({"date", "ticker"})

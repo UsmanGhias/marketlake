@@ -258,11 +258,28 @@ def walk(lake_root: Path | str) -> Usage:
     refusals: list[str] = []
 
     def refuse(where: object, exc: OSError) -> None:
+        """Name a refused path relative to the lake root, never absolutely.
+
+        The dashboard publishes these strings in an HTTP response, and the integration
+        suite states the invariant they have to keep: "no response carries a path or a
+        secret". An absolute path hands a reader who cannot read the filesystem the lake
+        root's location on disk. ``_nightly_reports`` and ``_open_quarantines`` already
+        report either a lake-relative path or the exception class alone, and this keeps
+        that convention. A path that will not sit under the root at all is reported by its
+        class alone rather than by a name, because there is nothing safe left to say.
+        """
         nonlocal refused
         refused += 1
-        if len(refusals) < NAMED_REFUSALS:
-            name = getattr(exc, "filename", None) or where
-            refusals.append(f"{name}: {type(exc).__name__}")
+        if len(refusals) >= NAMED_REFUSALS:
+            return
+        raw = getattr(exc, "filename", None) or where
+        try:
+            name = Path(str(raw)).relative_to(root).as_posix()
+        except ValueError:
+            refusals.append(type(exc).__name__)
+            return
+        where_name = "the lake root" if name in ("", ".") else name
+        refusals.append(f"{where_name}: {type(exc).__name__}")
 
     for parent, _dirs, names in os.walk(root, onerror=lambda exc: refuse(root, exc)):
         for name in names:
@@ -327,6 +344,14 @@ def _exhaustion(
     that answers every day would walk to ``date.max``. Either way the capture-day count
     stands and only the date is withheld.
     """
+    if capture_days_left <= 0:
+        # A disk with less than one day of growth left. ``free // peak`` truncates every
+        # such reading to zero, so the whole band from a full disk up to one day's
+        # headroom lands here. It exhausts today, and saying so is the entire point of the
+        # module: a walk that stepped forward looking for a zero it had already passed
+        # returned no date at all, which reads as a runway too long to date. That is the
+        # alarm inverted at the one moment it exists for.
+        return start, False
     day = start
     left = capture_days_left
     for _step in range(MAX_FORWARD_DAYS):
@@ -337,7 +362,7 @@ def _exhaustion(
             return None, True
         if session:
             left -= 1
-            if left == 0:
+            if left <= 0:
                 return day, False
     return None, True
 
