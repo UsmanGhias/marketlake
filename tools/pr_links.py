@@ -23,15 +23,24 @@ what the author *meant*, so it reads through code spans, markdown links and a si
 break. GitHub's answer stays the ground truth for what actually happened, and a disagreement
 between the two is the defect.
 
-Three rules decide the verdict, and each carries what it measured over all 182 bodies.
+Four rules decide the verdict, and each carries what it measured over all 182 bodies.
 
-1. A claimed reference missing from the parsed set **fails**. Twelve true hits, zero false.
-2. A reference written ``Part of`` that GitHub parsed as closing **reports only**. Zero true
+1. A claimed reference missing from the parsed set **fails**. Eleven true hits and one false.
+2. A claim on an issue that **closed before this pull request existed** reports rather than
+   fails. That one rule is what makes rule 1 eleven-for-eleven instead of twelve-for-twelve.
+   #112 narrates #85's body fifteen hours after #77 had already closed, quoting the string
+   ``` `Closes #77.` ``` inside a numbered list. A closed issue cannot be closed again, so
+   nothing is lost there and GitHub parsing nothing is correct.
+3. A reference written ``Part of`` that GitHub parsed as closing **reports only**. Zero true
    hits, and its single firing is #147, which quotes a commit trailer in prose. A failing
    gate there would refuse a correct pull request for a defect that has never occurred.
-3. A pull request claiming nothing and parsing nothing **says nothing**. Eighty-one of the
+4. A pull request claiming nothing and parsing nothing **says nothing**. Eighty-one of the
    182 link no issue at all, so a check demanding a link on every pull request would refuse
    nearly half of them.
+
+The scan cannot tell a claim from a quotation, and this repository quotes closing keywords
+constantly. Rule 2 removes the one case the corpus actually contains. The rest is named as a
+limit rather than solved: write an example without a ``#`` where one is needed.
 """
 
 from __future__ import annotations
@@ -48,14 +57,20 @@ MARKER = "<!-- pr-links-check -->"
 
 _KEYWORDS = r"close[sd]?|fix(?:e[sd])?|resolve[sd]?"
 
-_GAP = r"[ \t]*:?[ \t]*\n?[ \t]*"
+_GAP = r"[ \t]*:?[ \t]*\r?\n?[ \t]*"
 """What may sit between a keyword and its reference.
 
-At most **one** newline and never a blank line. Both halves are measured. Allowing one
+At most **one** line ending and never a blank line. Both halves are measured. Allowing one
 newline is what catches #364 and #372, whose keyword and number sit on adjacent lines.
 Refusing a blank line is what stops #194, whose ``## How #184 was resolved`` heading is
 followed by a blank line and then a link. A gap that crosses blank lines reads that heading
 as a claim and fails a correct pull request.
+
+The ``\r`` is not decoration. A body edited through the web form comes back with CRLF line
+endings, because that is what an HTML textarea submits, and every body in this repository's
+corpus came from ``gh`` with LF. Without it, the one spelling the ``edited`` trigger exists
+to re-check is the one spelling the scan goes blind to, and a blind scan reports that
+nothing is wrong.
 """
 
 _REPO = r"(?:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+))?"
@@ -66,8 +81,29 @@ upstream issue number. None of the fifteen follows a keyword, so nothing there i
 today. This prefix is what catches the case when that stops holding.
 """
 
-_CLOSES = re.compile(rf"\b(?:{_KEYWORDS})\b{_GAP}[`\[]*{_REPO}#(\d+)", re.IGNORECASE)
-_PART_OF = re.compile(rf"\bpart of\b{_GAP}[`\[]*{_REPO}#(\d+)", re.IGNORECASE)
+_URL = r"https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/"
+"""A full issue URL, which GitHub parses and a bare ``#NN`` scan does not see.
+
+Zero of the 182 bodies write a keyword in front of one, but 65 of them carry an issue URL
+somewhere, so the vocabulary is already in the habit. Inside a code span GitHub rejects it
+and a scan that cannot see it reports that nothing is wrong, which is the original defect
+with the alarm switched off. Adding this form introduced no new failure across the corpus.
+"""
+
+_REF = rf"(?:{_REPO}#|GH-|{_URL})(\d+)"
+"""Every spelling of a reference: bare, ``owner/repo#NN``, ``GH-NN`` and a full issue URL."""
+
+_DECOR = r"(?:[`(*_]|\[[^\]\n]{0,60}\]\(|\[)*"
+"""Leading decoration the house style puts in front of a reference.
+
+Backticks, brackets and emphasis, plus a markdown link whose label is words rather than the
+number, as in ``Closes [the issue](.../issues/390)``. GitHub parses that one and a scan
+stopping at the bracket does not, so without the label form the check reads a real claim as
+no claim at all.
+"""
+
+_CLOSES = re.compile(rf"\b(?:{_KEYWORDS})\b{_GAP}{_DECOR}{_REF}", re.IGNORECASE)
+_PART_OF = re.compile(rf"\bpart of\b{_GAP}{_DECOR}{_REF}", re.IGNORECASE)
 
 
 class CouldNotRun(Exception):
@@ -93,6 +129,13 @@ class Verdict:
     missing: tuple[int, ...]
     """Claimed as closing and absent from the parsed set. This is what fails the check."""
 
+    stale: tuple[int, ...]
+    """Claimed, unparsed, and already closed before this pull request existed.
+
+    Reported rather than failed. See rule 2 in the module docstring: a closed issue cannot be
+    closed again, so the body is narrating rather than claiming, and #112 is the case.
+    """
+
     contradicted: tuple[int, ...]
     """Written ``Part of`` and parsed as closing. Reported, never failed. See rule 2."""
 
@@ -116,8 +159,16 @@ class Verdict:
 
 
 def _local(match: re.Match[str], repo: str) -> int | None:
-    """The issue number when a match names this repository, and ``None`` when it does not."""
-    owner, name, number = match.group(1), match.group(2), int(match.group(3))
+    """The issue number when a match names this repository, and ``None`` when it does not.
+
+    The pattern carries two optional owner and name pairs, one from the ``owner/repo#NN``
+    prefix and one from a full issue URL, so whichever matched is the one to compare. Both
+    sides are lowered, because GitHub treats an owner and a repository name as
+    case-insensitive and ``L3a0/Marketlake#390`` is the same issue.
+    """
+    prefix_owner, prefix_name, url_owner, url_name = match.group(1, 2, 3, 4)
+    owner, name = (prefix_owner, prefix_name) if prefix_owner else (url_owner, url_name)
+    number = int(match.group(5))
     if owner is None:
         return number
     return number if f"{owner}/{name}".lower() == repo.lower() else None
@@ -147,10 +198,18 @@ def parsed_numbers(references: list[dict], repo: str) -> frozenset[int]:
     return frozenset(here)
 
 
-def assess(claims: Claims, parsed: frozenset[int]) -> Verdict:
-    """Set the body's claims against GitHub's answer."""
+def assess(
+    claims: Claims, parsed: frozenset[int], already_closed: frozenset[int] = frozenset()
+) -> Verdict:
+    """Set the body's claims against GitHub's answer.
+
+    ``already_closed`` holds the claimed issues that closed before this pull request existed.
+    They move out of ``missing`` and into ``stale``, which reports and does not fail.
+    """
+    unparsed = claims.closes - parsed
     return Verdict(
-        missing=tuple(sorted(claims.closes - parsed)),
+        missing=tuple(sorted(unparsed - already_closed)),
+        stale=tuple(sorted(unparsed & already_closed)),
         contradicted=tuple(sorted(claims.part_of & parsed)),
         unclaimed=tuple(sorted(parsed - claims.closes)),
         parsed=tuple(sorted(parsed)),
@@ -202,6 +261,15 @@ def render(verdict: Verdict, repo: str, pr: int) -> str:
             "",
             f"GitHub parsed this pull request as closing {_refs(verdict.parsed)}.",
         ]
+    if verdict.stale:
+        lines += [
+            "",
+            f"The body also names {_refs(verdict.stale)} after a closing keyword, and GitHub "
+            "did not parse that either. It is reported rather than failed because "
+            f"{'each of those issues' if len(verdict.stale) > 1 else 'that issue'} had already "
+            "closed before this pull request existed, so nothing is lost. A body quoting "
+            "another pull request's text reads this way.",
+        ]
     if verdict.contradicted:
         lines += [
             "",
@@ -243,20 +311,63 @@ def _gh(args: list[str]) -> str:
     return done.stdout
 
 
-def fetch(pr: int, repo: str) -> tuple[str | None, list[dict]]:
-    """The body and the parsed references, in one query.
+def fetch(pr: int, repo: str) -> tuple[str | None, list[dict], str]:
+    """The body, the parsed references and the creation time, in one query.
 
     The body is read from the API rather than from the workflow's event payload. That keeps
     it out of every shell expression, which is what the repository's code scanning setup
     flags, and it also means an edit made seconds ago and the parse of that edit come from
     the same read.
     """
-    raw = _gh(["pr", "view", str(pr), "--repo", repo, "--json", "body,closingIssuesReferences"])
+    raw = _gh(
+        ["pr", "view", str(pr), "--repo", repo, "--json", "body,closingIssuesReferences,createdAt"]
+    )
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise CouldNotRun(f"gh returned something that is not JSON: {exc}") from exc
-    return payload.get("body"), payload.get("closingIssuesReferences") or []
+    return (
+        payload.get("body"),
+        payload.get("closingIssuesReferences") or [],
+        payload.get("createdAt", ""),
+    )
+
+
+def closed_before(numbers: tuple[int, ...], when: str, repo: str) -> frozenset[int]:
+    """Which of these issues had already closed when the pull request was created.
+
+    Only ever asked about claims that did not parse, so it costs a query on the failure path
+    and nothing on the ordinary one. A query that fails returns nothing rather than raising,
+    which leaves every claim in ``missing``. Failing loudly on an unproven claim is the safe
+    direction: the worst case is the false alarm this rule exists to remove, and the comment
+    says enough for a reader to dismiss it.
+    """
+    if not numbers or not when:
+        return frozenset()
+    owner, _, name = repo.partition("/")
+    fields = " ".join(f"i{n}: issue(number: {n}) {{ number closedAt }}" for n in numbers)
+    query = f'{{ repository(owner: "{owner}", name: "{name}") {{ {fields} }} }}'
+    try:
+        payload = json.loads(_gh(["api", "graphql", "-f", f"query={query}"]))
+    except (CouldNotRun, json.JSONDecodeError, KeyError, TypeError):
+        return frozenset()
+    issues = ((payload.get("data") or {}).get("repository") or {}).values()
+    return frozenset(
+        issue["number"]
+        for issue in issues
+        if issue and issue.get("closedAt") and issue["closedAt"] < when
+    )
+
+
+AUTHOR = "github-actions[bot]"
+"""The only author whose comment this check will edit.
+
+The marker alone is not enough to identify its own comment. A person quoting the check's
+output in raw markdown carries the marker too, and a listing comes back oldest first, so the
+quote would be found first, overwritten with a verdict, and then overwritten again on every
+later run while the check's real comment went stale. Repository write access is enough to
+edit anyone's comment, so nothing but this filter stops it.
+"""
 
 
 def _existing_comment(pr: int, repo: str) -> int | None:
@@ -266,8 +377,11 @@ def _existing_comment(pr: int, repo: str) -> int | None:
     except json.JSONDecodeError as exc:
         raise CouldNotRun(f"comment listing is not JSON: {exc}") from exc
     for comment in comments:
-        if MARKER in (comment.get("body") or ""):
-            return int(comment["id"])
+        if MARKER not in (comment.get("body") or ""):
+            continue
+        if (comment.get("user") or {}).get("login") != AUTHOR:
+            continue
+        return int(comment["id"])
     return None
 
 
@@ -308,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
     pr = int(args[0])
 
     try:
-        body, references = fetch(pr, repo)
+        body, references, created_at = fetch(pr, repo)
     except CouldNotRun as exc:
         print(f"could not run: {exc}", file=sys.stderr)
         try:
@@ -317,9 +431,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"could not say so either: {second}", file=sys.stderr)
         return 2
 
-    verdict = assess(scan(body, repo), parsed_numbers(references, repo))
+    claims = scan(body, repo)
+    parsed = parsed_numbers(references, repo)
+    unparsed = tuple(sorted(claims.closes - parsed))
+    verdict = assess(claims, parsed, closed_before(unparsed, created_at, repo))
     comment = render(verdict, repo, pr)
     print(f"claimed {_refs(verdict.claimed)}; GitHub parsed {_refs(verdict.parsed)}")
+    if verdict.stale:
+        print(f"already closed before this pull request existed: {_refs(verdict.stale)}")
 
     try:
         print(publish(comment, pr, repo, only_if_present=verdict.silent))
