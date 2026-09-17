@@ -12,6 +12,7 @@ the object that wrote it.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
 from datetime import UTC, datetime
@@ -25,11 +26,21 @@ from lake import journal, paths
 from lake.lock import lake_lock
 from lake.manifest import latest_entries, read_manifest, scrub
 from lake.paths import TEMP_MARKER
+from lake.report import redacted
 from lake.schema_versions import (
+    CONFLICT_EVENT,
+    CONFLICTING,
     LEDGER_FILENAME,
     LEDGER_PARTITION,
     LEDGER_SCHEMA,
     LEDGER_SCHEMA_VERSION,
+    PAGE_BODY_BYTE_CAP,
+    PAGE_COLUMN_CAP,
+    RECORDED,
+    UNREADABLE,
+    UNREADABLE_EVENT,
+    UNRECORDED,
+    UNRECORDED_EVENT,
     LedgerUnreadable,
     RecordedVersion,
     SchemaVersionConflict,
@@ -37,6 +48,8 @@ from lake.schema_versions import (
     SchemaVersionsError,
     UnsupportedLedgerSchemaVersion,
     _conflict_detail,
+    _page_moved,
+    check_running_version,
     ledger_path,
     main,
     record_schema_version,
@@ -564,3 +577,521 @@ def test_a_failed_write_leaves_no_temp_file_behind(tmp_path, monkeypatch):
 
     assert not target.exists()
     assert list(target.parent.iterdir()) == []
+
+
+# -- is the running version recorded at all -----------------------------------
+
+# Marketlake #130. ``record_schema_version`` is hand-invoked beside a deliberate bump and
+# nothing forced the run, so a version reached the lake with its shape recorded nowhere and
+# every read of its rows refused. These drive the check that says so.
+
+
+def _narrowed(surface: str = journal.CHAINS_SURFACE) -> dict[str, dict[str, str]]:
+    """The running shape with one column taken off ``surface``.
+
+    This is a column added without a bump, seen from the ledger's side. It is the direction
+    that costs a read its diagnosis: the projection reports the retype it would otherwise have
+    named as a value the column refused.
+    """
+    shapes = {name: dict(columns) for name, columns in running_fingerprints().items()}
+    shapes[surface].pop("bid")
+    return shapes
+
+
+def _widened(surface: str = journal.CHAINS_SURFACE) -> dict[str, dict[str, str]]:
+    """The running shape with one column the running code does not carry.
+
+    This is a column dropped without a bump. It is the silent direction: the column sits
+    outside the projection's reachable set, nothing is reported, and the read comes back
+    whole while the dropped column's nulls read as vendor nulls.
+    """
+    shapes = {name: dict(columns) for name, columns in running_fingerprints().items()}
+    shapes[surface]["gamma_impact"] = "double"
+    return shapes
+
+
+def _record_shape(lake_root: Path, fingerprints, version: int | None = None) -> None:
+    """Put one version's shape in the ledger by hand, so a test can record a wrong one."""
+    entry = RecordedVersion(
+        version=journal.SCHEMA_VERSION if version is None else version,
+        recorded_at=NOW,
+        fingerprints=fingerprints,
+    )
+    SchemaVersionLedger([entry]).write(ledger_path(lake_root))
+
+
+def test_the_version_a_run_recorded_reads_back_as_recorded(lake_root):
+    """The healthy verdict, and the only one that says nothing anywhere."""
+    _record(lake_root)
+
+    check = check_running_version(lake_root)
+
+    assert check.ok
+    assert check.state == RECORDED
+    assert check.version == journal.SCHEMA_VERSION
+    assert check.recorded == (journal.SCHEMA_VERSION,)
+    # Every reportable field is absent, which is what makes "say nothing when healthy" a
+    # property of the verdict rather than a rule each caller has to remember.
+    assert (check.summary, check.page_body, check.detail, check.event, check.title) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_a_lake_whose_ledger_was_never_written_reads_as_unrecorded(lake_root):
+    """The condition this issue is about: the tool was never run against this lake."""
+    check = check_running_version(lake_root)
+
+    assert not check.ok
+    assert check.state == UNRECORDED
+    assert check.recorded == ()
+    assert check.event == UNRECORDED_EVENT
+    assert str(journal.SCHEMA_VERSION) in check.page_body
+
+
+def test_a_ledger_holding_only_an_earlier_version_reads_as_unrecorded(lake_root):
+    """The live shape on 2026-09-17: version 1 recorded, version 2 running and absent.
+
+    The versions the ledger does hold come back on the verdict, because a reader looking at a
+    page needs to tell a lake that was never recorded from one whose recording stopped at an
+    earlier bump.
+    """
+    _record_shape(lake_root, running_fingerprints(), version=journal.SCHEMA_VERSION - 1)
+
+    check = check_running_version(lake_root)
+
+    assert check.state == UNRECORDED
+    assert check.recorded == (journal.SCHEMA_VERSION - 1,)
+    assert str(journal.SCHEMA_VERSION - 1) in check.page_body
+
+
+@pytest.mark.parametrize(
+    "shape, moved",
+    [(_narrowed, "added bid"), (_widened, "dropped gamma_impact")],
+    ids=["narrower", "wider"],
+)
+def test_the_running_version_recorded_under_another_shape_reads_as_conflicting(
+    lake_root, shape, moved
+):
+    """Both directions of the shape this check exists to catch, and the reader cannot.
+
+    ``project_extra`` asks the ledger ``has_column`` and never compares the recorded shape
+    against ``journal.schema_fingerprint``, so a wrong record either misdiagnoses a retype or,
+    in the wider direction, reports nothing at all. Neither reaches a person. This does.
+    """
+    _record_shape(lake_root, shape())
+
+    check = check_running_version(lake_root)
+
+    assert not check.ok
+    assert check.state == CONFLICTING
+    assert check.event == CONFLICT_EVENT
+    assert check.recorded == (journal.SCHEMA_VERSION,)
+    # The column that moved is named, which is the whole reason the fingerprint is a column
+    # list rather than a digest, and it is named under the right verb. The two arguments are
+    # one swap apart, and swapped they render the right column the wrong way round, which
+    # sends an operator to put back a column they should be taking out.
+    assert moved in check.page_body
+
+
+def test_the_check_agrees_with_the_run_it_sends_an_operator_to(lake_root):
+    """A conflict the check reports is a conflict ``record_schema_version`` refuses.
+
+    A check deriving its own comparison could pass here and then fail the operator's run,
+    which pages nobody and then refuses the repair. Both read ``_as_plain`` against
+    ``running_fingerprints``, so they cannot disagree.
+    """
+    _record_shape(lake_root, _narrowed())
+
+    assert check_running_version(lake_root).state == CONFLICTING
+    with pytest.raises(SchemaVersionConflict):
+        _record(lake_root)
+
+
+def test_a_run_that_was_owed_clears_the_verdict(lake_root):
+    """The repair is the tool, and the check goes quiet the moment it lands."""
+    assert check_running_version(lake_root).state == UNRECORDED
+
+    _record(lake_root)
+
+    assert check_running_version(lake_root).ok
+
+
+# -- the check never raises ---------------------------------------------------
+
+
+def _bytes_that_are_not_parquet(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a parquet file")
+
+
+def _truncated_parquet(path: Path) -> None:
+    whole = path.parent / "whole.parquet"
+    SchemaVersionLedger().write(whole)
+    payload = whole.read_bytes()
+    whole.unlink()
+    path.write_bytes(payload[: len(payload) // 2])
+
+
+def _other_columns(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"who": ["me"], "what": [1]}), path)
+
+
+def _a_ledger_format_from_the_future(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "journal_schema_version": pa.array([journal.SCHEMA_VERSION], pa.int32()),
+                "surface": [journal.CHAINS_SURFACE],
+                "column_name": ["bid"],
+                "column_type": ["double"],
+                "recorded_at": pa.array([NOW], pa.timestamp("us", tz="UTC")),
+                "schema_version": pa.array([LEDGER_SCHEMA_VERSION + 1], pa.int32()),
+            },
+            schema=LEDGER_SCHEMA,
+        ),
+        path,
+    )
+
+
+def _a_directory(path: Path) -> None:
+    path.mkdir(parents=True)
+
+
+def _a_null_surface(path: Path) -> None:
+    """A ledger the pinned schema accepts and no run could have written.
+
+    Every field of ``LEDGER_SCHEMA`` is nullable, so this file parses. It is the shape that
+    proves the guard has to cover the decision rather than the read: a null reaches ``sorted``
+    inside ``_page_moved`` as a ``TypeError``, long after ``read`` has returned.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "journal_schema_version": pa.array([journal.SCHEMA_VERSION], pa.int32()),
+                "surface": pa.array([None], pa.string()),
+                "column_name": ["bid"],
+                "column_type": ["double"],
+                "recorded_at": pa.array([NOW], pa.timestamp("us", tz="UTC")),
+                "schema_version": pa.array([LEDGER_SCHEMA_VERSION], pa.int32()),
+            },
+            schema=LEDGER_SCHEMA,
+        ),
+        path,
+    )
+
+
+def _the_right_names_at_the_wrong_types(path: Path) -> None:
+    """A foreign parquet whose column names match, which no ``KeyError`` can catch."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "journal_schema_version": pa.array([journal.SCHEMA_VERSION], pa.int32()),
+                "surface": pa.array([7], pa.int64()),
+                "column_name": pa.array([9], pa.int64()),
+                "column_type": ["double"],
+                "recorded_at": pa.array([NOW], pa.timestamp("us", tz="UTC")),
+                "schema_version": pa.array([LEDGER_SCHEMA_VERSION], pa.int32()),
+            }
+        ),
+        path,
+    )
+
+
+@pytest.mark.parametrize(
+    "build, state",
+    [
+        (_bytes_that_are_not_parquet, UNREADABLE),
+        (_truncated_parquet, UNREADABLE),
+        (_other_columns, UNREADABLE),
+        (_a_ledger_format_from_the_future, UNREADABLE),
+        (_a_directory, UNRECORDED),
+        (_a_null_surface, UNREADABLE),
+        (_the_right_names_at_the_wrong_types, UNREADABLE),
+    ],
+    ids=[
+        "not parquet",
+        "truncated",
+        "other columns",
+        "future format",
+        "a directory",
+        "a null surface",
+        "the right names at the wrong types",
+    ],
+)
+def test_no_ledger_this_code_cannot_read_takes_the_daemon_down(lake_root, build, state):
+    """Every way the read fails becomes a verdict, because the caller is a daemon at startup.
+
+    The list is not two long, which is why the guard is broad rather than a set of named
+    classes. An absent file raises ``OSError``, a torn one ``LedgerUnreadable``, a format this
+    code does not read ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that
+    path a bare ``KeyError``. A guard naming the first three lets the fourth take the session.
+
+    The list is not even one long past the read. Every field of ``LEDGER_SCHEMA`` is nullable,
+    so a ledger with a null ``surface`` parses and then reaches ``sorted`` inside
+    ``_page_moved`` as a ``TypeError``. A foreign parquet whose names match and whose types do
+    not reaches ``str.join`` the same way, and no ``KeyError`` sees it. So the guard covers the
+    whole decision rather than the read.
+
+    A directory is the odd row. ``pq.read_table`` reads one as a dataset and an empty one
+    yields an empty ledger, so the running version is simply absent from it.
+    """
+    build(ledger_path(lake_root))
+
+    check = check_running_version(lake_root)
+
+    assert check.state == state
+    assert check.version == journal.SCHEMA_VERSION
+
+
+def test_an_unreadable_ledger_says_which_file_and_what_refused_it(lake_root):
+    """The operator needs the class, since the three verdicts send them to three repairs."""
+    _other_columns(ledger_path(lake_root))
+
+    check = check_running_version(lake_root)
+
+    assert check.event == UNREADABLE_EVENT
+    assert "KeyError" in check.summary
+    assert str(ledger_path(lake_root)) in check.detail
+
+
+def test_a_ledger_this_process_may_not_open_is_unreadable_rather_than_unrecorded(lake_root):
+    """A locked ledger is not an absent one, and saying otherwise sends an operator nowhere.
+
+    ``python -m lake.schema_versions`` is the repair a "not recorded" page names, and it opens
+    this same file and dies the same way. The sweep's reference readers were widened for
+    exactly that reason under marketlake #435, whose own test locks this very file.
+
+    ``Path.exists`` answers False on a permission error, so a check that looked before reading
+    would fall into the absent arm. This reads straight through and tells the two apart by
+    class.
+    """
+    _record(lake_root)
+    target = ledger_path(lake_root)
+    os.chmod(target, 0o000)
+    try:
+        check = check_running_version(lake_root)
+    finally:
+        os.chmod(target, 0o644)
+
+    assert check.state == UNREADABLE
+    assert check.event == UNREADABLE_EVENT
+    assert "PermissionError" in check.summary
+    # And the shape really is recorded, so "not recorded" would have been false as well as
+    # useless.
+    assert check_running_version(lake_root).ok
+
+
+def test_a_lake_root_that_does_not_exist_reads_as_unrecorded(tmp_path):
+    """An unmounted drive is not a crash. It reads as no ledger, and the detail names a path.
+
+    That path is the only thing separating this from a version genuinely never recorded, which
+    is why the stderr detail carries it and the page and the report line do not.
+    """
+    missing = tmp_path / "not-mounted"
+
+    check = check_running_version(missing)
+
+    assert check.state == UNRECORDED
+    assert str(missing) in check.detail
+
+
+# -- what the page and the report line are allowed to carry -------------------
+
+
+def _three_clause_conflict() -> dict[str, dict[str, str]]:
+    """A recorded shape that drops, adds and retypes columns on every pinned surface.
+
+    This is what ``_page_moved`` can actually emit at its widest: three clauses per surface
+    across three surfaces, so nine capped lists in one body. The all-retyped shape below
+    produces one clause per surface and is the narrow case, not the wide one.
+    """
+    shape = {}
+    for surface, columns in running_fingerprints().items():
+        kept = dict(list(columns.items())[:PAGE_COLUMN_CAP])
+        for index in range(PAGE_COLUMN_CAP):
+            kept[f"gone_{surface}_{index:02d}"] = "double"
+        for name in list(kept)[:PAGE_COLUMN_CAP]:
+            kept[name] = "RETYPED"
+        shape[surface] = kept
+    return shape
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda: {
+            surface: {name: "RETYPED" for name in columns}
+            for surface, columns in running_fingerprints().items()
+        },
+        _three_clause_conflict,
+    ],
+    ids=["every column retyped", "dropped, added and retyped on every surface"],
+)
+def test_the_page_body_stays_inside_the_design_body_budget(lake_root, shape):
+    """A conflict wide enough to blow the budget still sends a page.
+
+    The design pins a page body at plain text under 1,000 bytes. ``_conflict_detail`` renders
+    every column that moved on every surface and is unbounded: 2,777 bytes when every column of
+    every surface is added and 5,677 when every one is retyped. The second is past ntfy's own
+    4,096-byte limit, which ``NtfyTransport`` answers with a 400 and does not retry, so uncapped
+    the page saying the most would be the page that never arrives.
+
+    ``PAGE_COLUMN_CAP`` alone does not bound it, which is why both shapes are driven.
+    ``_page_moved`` emits up to three clauses per surface, so nine capped lists can land in one
+    body: measured at 1,547 bytes with every list inside the column cap. The all-retyped shape
+    yields one clause per surface and passes on a body the column cap never had to bound, so a
+    test driving it alone would hold nothing.
+    """
+    _record_shape(lake_root, shape())
+
+    check = check_running_version(lake_root)
+
+    assert check.state == CONFLICTING
+    assert len(check.page_body.encode("utf-8")) <= PAGE_BODY_BYTE_CAP
+    # The version leads the body and survives any cut, because the head is never what gives way.
+    assert str(journal.SCHEMA_VERSION) in check.page_body
+    # The uncapped rendering is still on the verdict, for the log the operator is sent to.
+    assert len(check.detail.encode("utf-8")) > PAGE_BODY_BYTE_CAP
+
+
+# -- what the page says moved ------------------------------------------------
+#
+# ``_page_moved`` is ``_conflict_detail``'s twin under the body budget, and the three cases
+# below mirror the three that already hold the older one. A page reached only through the
+# verdict is reached through one assertion that some column name appears in it, which a walk
+# over the wrong side of the comparison still satisfies.
+
+
+def test_the_page_names_a_surface_only_the_ledger_holds():
+    """The walk is over the union, so a surface the running code dropped still gets named.
+
+    Walking the derived side alone renders an empty string, and the page then says a version
+    disagrees and names nothing at all.
+    """
+    derived = running_fingerprints()
+    recorded = {**derived, "ghost_surface": {"who": "string"}}
+
+    moved = _page_moved(derived, recorded)
+
+    assert "ghost_surface" in moved
+    assert "who" in moved
+
+
+def test_the_page_says_which_way_a_column_moved():
+    """The verb is the whole instruction. A column the running code has and the ledger does
+    not is *added*, and calling it dropped sends an operator the opposite way.
+
+    Swapping the two arguments is a one-word edit that renders the right column under the
+    wrong verb, which is the shape a test asserting only that the name appears cannot see.
+    """
+    derived = running_fingerprints()
+    recorded = {surface: dict(columns) for surface, columns in derived.items()}
+    recorded[journal.CHAINS_SURFACE].pop("bid")
+
+    assert "added bid" in _page_moved(derived, recorded)
+    assert "dropped bid" in _page_moved(recorded, derived)
+
+
+def test_the_page_stays_silent_about_a_surface_that_did_not_move():
+    """One surface disagreeing names one surface. The other two are not mentioned."""
+    derived = running_fingerprints()
+    recorded = {surface: dict(columns) for surface, columns in derived.items()}
+    recorded[journal.BARS_SURFACE].pop("volume")
+
+    moved = _page_moved(derived, recorded)
+
+    assert journal.BARS_SURFACE in moved
+    assert journal.CHAINS_SURFACE not in moved
+    assert journal.QUOTES_SURFACE not in moved
+
+
+def test_the_page_names_the_cap_worth_of_columns_and_counts_the_rest(lake_root):
+    """One surface's clause names exactly ``PAGE_COLUMN_CAP`` columns, then says how many are
+    left.
+
+    The count is what separates one moved column from a wholesale retype, and the number of
+    names is what makes the page worth reading at all. A body bounded only by its byte cap
+    would satisfy the budget while naming whatever happened to fit.
+    """
+    extra = PAGE_COLUMN_CAP + 5
+    shapes = {surface: dict(columns) for surface, columns in running_fingerprints().items()}
+    for index in range(extra):
+        shapes[journal.CHAINS_SURFACE][f"gone_{index:02d}"] = "double"
+    _record_shape(lake_root, shapes)
+
+    body = check_running_version(lake_root).page_body
+
+    assert f"gone_{PAGE_COLUMN_CAP - 1:02d}" in body
+    assert f"gone_{PAGE_COLUMN_CAP:02d}" not in body
+    assert f"and {extra - PAGE_COLUMN_CAP} more" in body
+
+
+def test_neither_the_page_nor_the_report_line_names_an_absolute_path(lake_root):
+    """``report.redacted`` exists to keep capture-machine paths out of a file the dashboard
+    may read, and a phone cannot reach a local path either way. Both name the ledger by its
+    lake-relative path instead, and the absolute one goes to stderr alone.
+    """
+    _record_shape(lake_root, _narrowed())
+
+    check = check_running_version(lake_root)
+
+    assert LEDGER_PARTITION in check.summary
+    assert LEDGER_PARTITION in check.page_body
+    assert str(lake_root) not in check.summary
+    assert str(lake_root) not in check.page_body
+    assert str(lake_root) in check.detail
+
+
+@pytest.mark.parametrize(
+    "build",
+    [lambda root: None, lambda root: _record_shape(root, _narrowed()), _other_columns],
+    ids=["unrecorded", "conflicting", "unreadable"],
+)
+def test_the_report_line_survives_redaction_whole(lake_root, build):
+    """``digest_body`` passes every report line through ``report.redacted``, which drops
+    everything past the second colon-separated field. A line composed as a place, then a
+    verdict, then a version would reach the phone with the version gone, so each holds two.
+    """
+    build(ledger_path(lake_root) if build is _other_columns else lake_root)
+
+    check = check_running_version(lake_root)
+
+    assert not check.ok
+    assert redacted(check.summary) == check.summary
+
+
+def test_the_three_event_names_are_three_names():
+    """Pinned as literals, because comparing the constants to themselves holds nothing.
+
+    A set built from the three constants and compared against a set of the same three
+    constants collapses on both sides the moment two of them are spelled alike, and passes.
+    That is what this file's first draft asserted.
+    """
+    assert len({UNRECORDED_EVENT, CONFLICT_EVENT, UNREADABLE_EVENT}) == 3
+    assert UNRECORDED_EVENT == "schema_version_unrecorded"
+    assert CONFLICT_EVENT == "schema_version_conflict"
+    assert UNREADABLE_EVENT == "schema_version_ledger_unreadable"
+
+
+def test_each_reportable_verdict_carries_an_event_of_its_own(lake_root):
+    """``alert._record`` keeps no body, and drops the title too when a page was refused, so
+    the event is the only field guaranteed to say which of the three went quiet.
+    """
+    events = set()
+    for build in (lambda: None, lambda: _record_shape(lake_root, _narrowed())):
+        ledger_path(lake_root).unlink(missing_ok=True)
+        build()
+        events.add(check_running_version(lake_root).event)
+    ledger_path(lake_root).unlink(missing_ok=True)
+    _other_columns(ledger_path(lake_root))
+    events.add(check_running_version(lake_root).event)
+
+    assert events == {UNRECORDED_EVENT, CONFLICT_EVENT, UNREADABLE_EVENT}

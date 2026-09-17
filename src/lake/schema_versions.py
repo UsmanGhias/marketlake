@@ -48,11 +48,12 @@ like any other.
 What the tool cannot do is reconstruct a version it was never run for. It records the
 version the running code carries, and it preserves every version already in the file. So a
 bump made without a run leaves that version's shape recorded nowhere, and a later run
-cannot fill the hole, because the code that knew the old shape is gone. Making the run
-happen is a separate question with an alerting decision of its own, and it is marketlake
-#130 rather than this module's business. What this module does do is refuse to paper over
-the evidence: a running version already in the ledger under a different shape raises
-rather than overwriting.
+cannot fill the hole, because the code that knew the old shape is gone. So the run has to
+happen, and what makes it happen is ``check_running_version`` below, which the daemon asks
+at startup and the vendor sweep asks every evening. It reports rather than repairs, for
+the reason its own docstring gives. What this module does do is refuse to paper over the
+evidence: a running version already in the ledger under a different shape raises rather
+than overwriting.
 
 Run it beside the deliberate version bump::
 
@@ -510,6 +511,289 @@ def record_schema_version_from_config(
     )
 
 
+# -- is the running version in the ledger --------------------------------------
+
+# The four answers :func:`check_running_version` gives. ``RECORDED`` is the healthy one and
+# the only one nothing reports.
+RECORDED = "recorded"
+UNRECORDED = "unrecorded"
+CONFLICTING = "conflicting"
+UNREADABLE = "unreadable"
+
+# One page event per reportable verdict, because the three name three different repairs.
+# ``alert._record`` keeps the event, the reason and the priority when a page fails to send,
+# keeps the title unless the page was refused, and never keeps the body. So the event is the
+# only field guaranteed to say which of the three went quiet.
+UNRECORDED_EVENT = "schema_version_unrecorded"
+CONFLICT_EVENT = "schema_version_conflict"
+UNREADABLE_EVENT = "schema_version_ledger_unreadable"
+
+# How many column names one surface contributes to a page body before the rendering stops and
+# says how many are left. The model is ``schema_drift.PAGE_COLUMN_CAP`` and so is the number,
+# because the reason is the same: the design pins a page body at plain text under 1,000 bytes,
+# and the uncapped rendering grows with the column count. Measured against the pinned schemas
+# this code carries, ``_conflict_detail`` runs to 596 bytes when one surface is missing from
+# the record, 2,777 when every column of every surface is added, and 5,677 when every one is
+# retyped. The last is past ntfy's own 4,096-byte body limit, which ``NtfyTransport`` answers
+# with a 400 and does not retry, so the page saying the most would be the page that never
+# arrives.
+#
+# The number is repeated rather than imported, and ``compact`` already carries a third copy for
+# the same reason. Reaching ``schema_drift`` from here would pull ``capture`` and the vendor
+# stack in behind it, into a module the read layer imports: ``loader``, ``extra_projection`` and
+# ``battery`` all import this one and none of them imports ``capture`` today. The daemon pays
+# that cost already, so it is the reader this protects rather than the writer.
+PAGE_COLUMN_CAP = 12
+
+# The hard bound on a page body, in bytes, which the column cap above does not supply on its
+# own. ``_page_moved`` emits up to three clauses per surface, dropped, added and retyped, across
+# three pinned surfaces, so nine capped lists can land in one body. Measured against the real
+# pinned schemas, twelve columns in each of those nine lists renders 1,547 bytes, every one of
+# them inside the column cap. ``schema_drift``'s cap bounds its body because it emits one list
+# per surface, and that does not carry over.
+#
+# The design pins page bodies at plain text under 1,000 bytes, so the assembled body is cut to
+# fit, the way ``sweep.digest_body`` cuts to ``DIGEST_BYTE_CAP``. The two caps do different
+# work: the column cap keeps an ordinary conflict readable and counted, and this one is the
+# guarantee. Truncating rather than dropping is the same trade the digest makes, because a page
+# that did not arrive is worse than a page that says less.
+PAGE_BODY_BYTE_CAP = 1000
+
+
+@dataclass(frozen=True)
+class RunningVersionCheck:
+    """Where the running ``journal.SCHEMA_VERSION`` stands in one lake's ledger.
+
+    ``state`` is one of the four above. ``recorded`` is every version the ledger holds, empty
+    when it holds none or could not be read.
+
+    The other four fields are ``None`` on a ``RECORDED`` verdict and set on every other, which
+    is what makes "say nothing when healthy" a property of this object rather than a rule each
+    caller has to remember.
+
+    ``summary`` is one line, safe for the nightly report. It carries no absolute path, because
+    ``report.redacted`` exists to keep capture-machine paths out of a file the dashboard may
+    read, and it holds at most two colon-separated fields, because that same function drops
+    everything past the second one and the version number has to survive the trip to a phone.
+
+    ``page_body`` is the capped rendering, under the design's body budget. ``detail`` is the
+    uncapped one for stderr, where the operator who has the log is the only reader, so it is
+    the one that may name the absolute path.
+    """
+
+    version: int
+    state: str
+    recorded: tuple[int, ...]
+    summary: str | None = None
+    page_body: str | None = None
+    detail: str | None = None
+    event: str | None = None
+    title: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """Whether the running version is recorded under the shape the running code derives."""
+        return self.state == RECORDED
+
+
+def _capped(names: Sequence[str]) -> str:
+    """Column names for a page body, cut at :data:`PAGE_COLUMN_CAP` with the rest counted.
+
+    The count survives the cut for ``schema_drift``'s reason: it is what separates one moved
+    column from a wholesale retype, and stderr names every column either way.
+
+    ``names`` is never empty. :func:`_page_moved` is the only caller and it asks only for a
+    list ``journal.fingerprint_diff`` reported as non-empty. A guard for the empty case would
+    be a line that cannot fire, which is a line the next reader has to reason about.
+    """
+    shown = list(names[:PAGE_COLUMN_CAP])
+    left = len(names) - len(shown)
+    if left:
+        shown.append(f"and {left} more")
+    return ", ".join(shown)
+
+
+def _page_moved(
+    derived: Mapping[str, Mapping[str, str]],
+    recorded: Mapping[str, Mapping[str, str]],
+) -> str:
+    """Every surface that disagrees, one capped clause each.
+
+    This is ``_conflict_detail``'s fact set under the body budget. The difference comes off
+    ``journal.fingerprint_diff`` in both, so the page and the stderr line can never disagree
+    about what moved.
+    """
+    clauses: list[str] = []
+    for surface in sorted(set(derived) | set(recorded)):
+        diff = journal.fingerprint_diff(derived.get(surface, {}), recorded.get(surface, {}))
+        if not diff.moved:
+            continue
+        parts = []
+        if diff.dropped:
+            parts.append(f"dropped {_capped(diff.dropped)}")
+        if diff.added:
+            parts.append(f"added {_capped(diff.added)}")
+        if diff.retyped:
+            parts.append(f"retyped {_capped([name for name, _, _ in diff.retyped])}")
+        clauses.append(f"{surface} {'; '.join(parts)}")
+    return ". ".join(clauses)
+
+
+def _within_body_cap(head: str, middle: str, tail: str) -> str:
+    """``head + middle + tail``, with ``middle`` cut so the whole fits :data:`PAGE_BODY_BYTE_CAP`.
+
+    Only the middle is cut. The head carries the version and the tail carries what the reader
+    loses, and both are short and fixed, so the part that grows is the part that gives way.
+    """
+    room = PAGE_BODY_BYTE_CAP - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+    encoded = middle.encode("utf-8")
+    if len(encoded) > room:
+        ellipsis = "\u2026"
+        keep = room - len(ellipsis.encode("utf-8"))
+        middle = encoded[:keep].decode("utf-8", "ignore") + ellipsis
+    return f"{head}{middle}{tail}"
+
+
+def _unrecorded_check(version: int, target: Path, recorded: tuple[int, ...]) -> RunningVersionCheck:
+    """The verdict for a running version the ledger holds no shape for.
+
+    ``recorded`` is empty when there is no ledger at all, which the body renders as "none"
+    rather than leaving blank: a reader on a phone needs to tell a lake that was never recorded
+    from one whose recording stopped at an earlier bump.
+    """
+    held = ", ".join(str(v) for v in recorded) or "none"
+    return RunningVersionCheck(
+        version=version,
+        state=UNRECORDED,
+        recorded=recorded,
+        summary=f"schema_version: {version} is not recorded in {LEDGER_PARTITION}",
+        page_body=(
+            f"journal schema_version {version} has no shape in {LEDGER_PARTITION}, "
+            f"which holds {held}. Every read of a row at this version refuses."
+        ),
+        detail=f"journal schema_version {version} is not recorded in {target}, which holds {held}",
+        event=UNRECORDED_EVENT,
+        title=f"Schema version {version} is not in the lake's ledger",
+    )
+
+
+def _unreadable_check(version: int, target: Path, exc: BaseException) -> RunningVersionCheck:
+    """The verdict for a ledger that is there and did not come back as one."""
+    return RunningVersionCheck(
+        version=version,
+        state=UNREADABLE,
+        recorded=(),
+        summary=f"schema_version: {LEDGER_PARTITION} could not be read, {type(exc).__name__}",
+        page_body=(
+            f"{LEDGER_PARTITION} is present and could not be read "
+            f"({type(exc).__name__}). Every read of the lake refuses, and the next "
+            "backup copies this file over the last good one."
+        ),
+        detail=f"{target} could not be read: {type(exc).__name__}: {exc}",
+        event=UNREADABLE_EVENT,
+        title="The lake's schema-version ledger cannot be read",
+    )
+
+
+def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
+    """Where the running ``journal.SCHEMA_VERSION`` stands in ``lake_root``'s ledger.
+
+    This is the answer to marketlake #130: nothing forces ``record_schema_version`` to be run
+    beside a deliberate bump, so a version can reach the lake with its shape recorded nowhere.
+    The daemon asks this at startup and the vendor sweep asks it every evening, and what each
+    does with a reportable verdict is its own.
+
+    It never raises, and the caller is why. A daemon that will not start captures nothing, and
+    under launchd's ``KeepAlive`` the successor reaches the same check and refuses again, so a
+    missing row in a reference table would cost a whole session. Anything the decision raises
+    becomes ``UNREADABLE`` instead. The guard is broad rather than a list of classes, because
+    the list is not two long: a torn file raises ``LedgerUnreadable``, a ledger format this
+    code does not read ``UnsupportedLedgerSchemaVersion``, and some other parquet file at that
+    path a bare ``KeyError``. That is ``sweep._counted``'s rule, that a summary must never cost
+    the record.
+
+    The guard covers the whole decision and not the read alone, because the file decides more
+    than whether it parses. Every field of :data:`LEDGER_SCHEMA` is nullable, so a ledger with a
+    null ``surface`` is a file the pinned schema accepts, and it reaches ``sorted`` in
+    :func:`_page_moved` as ``TypeError: '<' not supported between instances of 'str' and
+    'NoneType'``. A foreign parquet whose column names match and whose types do not reaches
+    ``str.join`` the same way. Both are content rather than a programming error, and a guard
+    stopping at the read would hand each of them to a daemon at startup.
+
+    Absent is the one condition that is not unreadable, and it is caught by class rather than
+    by looking first. ``FileNotFoundError`` alone means no ledger. A ``PermissionError`` or an
+    I/O error on a file that is there means the shape is recorded and this process cannot see
+    it, which is a different sentence and a different repair. Reporting that as "not recorded"
+    would send an operator to ``python -m lake.schema_versions``, which opens the same file and
+    dies the same way. The sweep's reference readers were widened for exactly that reason under
+    marketlake #435.
+
+    It takes no lock and writes nothing. :meth:`SchemaVersionLedger.write` goes through a temp
+    file and a rename, so a lockless read sees the whole old file or the whole new one, and the
+    operator repairing this can run the tool while the daemon is live.
+
+    The comparison is ``record_schema_version``'s own, ``_as_plain`` against
+    :func:`running_fingerprints`. A second derivation could pass here and then fail the
+    operator's run, which pages nobody and then refuses the repair.
+
+    What this cannot see is a version that reached the lake and is no longer the running one.
+    A rollback leaves those rows unrecorded and this reads ``RECORDED``. Answering that needs a
+    walk over every partition's distinct ``schema_version``, and the repair it would name is
+    one nothing can perform, since a run records the running version alone.
+    """
+    target = ledger_path(lake_root)
+    version = journal.SCHEMA_VERSION
+    try:
+        return _decide(target, version)
+    except FileNotFoundError:
+        # No ledger, which is not a corrupt one. ``loader._ledger`` tells the two apart for the
+        # same reason. Reading straight through rather than asking ``exists`` first is what
+        # keeps a present-but-unreadable file out of this arm: ``Path.exists`` answers False on
+        # a permission error, so looking first would call a locked ledger an absent one.
+        return _unrecorded_check(version, target, ())
+    except Exception as exc:  # noqa: BLE001 - a startup check must never cost the session
+        return _unreadable_check(version, target, exc)
+
+
+def _decide(target: Path, version: int) -> RunningVersionCheck:
+    """The verdict itself. Every raise it can make is the caller's to turn into one."""
+    ledger = SchemaVersionLedger.read(target)
+    recorded = ledger.versions()
+    entry = ledger.get(version)
+    if entry is None:
+        return _unrecorded_check(version, target, recorded)
+
+    derived = running_fingerprints()
+    if _as_plain(entry.fingerprints) != derived:
+        return RunningVersionCheck(
+            version=version,
+            state=CONFLICTING,
+            recorded=recorded,
+            summary=(
+                f"schema_version: {version} is recorded in {LEDGER_PARTITION} under a "
+                "different shape"
+            ),
+            page_body=_within_body_cap(
+                f"journal schema_version {version} is recorded in {LEDGER_PARTITION} under a "
+                "different shape. ",
+                _page_moved(derived, entry.fingerprints),
+                ". Rows written now decode against the recorded shape rather than this one.",
+            ),
+            # The absolute path leads, because stderr is the one reader that gets it and
+            # an operator with two lakes on one machine needs to know which one disagreed.
+            detail="\n".join(
+                [
+                    f"the ledger at {target} disagrees:",
+                    _conflict_detail(version, derived, entry.fingerprints),
+                ]
+            ),
+            event=CONFLICT_EVENT,
+            title=f"Schema version {version} is recorded under a different shape",
+        )
+
+    return RunningVersionCheck(version=version, state=RECORDED, recorded=recorded)
+
+
 def _build_parser():
     import argparse
 
@@ -534,17 +818,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "CONFLICTING",
+    "CONFLICT_EVENT",
     "LEDGER_FILENAME",
     "LEDGER_PARTITION",
     "LEDGER_SCHEMA",
     "LEDGER_SCHEMA_VERSION",
     "LedgerUnreadable",
+    "RECORDED",
     "RecordedVersion",
+    "RunningVersionCheck",
     "SchemaVersionConflict",
     "SchemaVersionLedger",
     "SchemaVersionReport",
     "SchemaVersionsError",
+    "UNRECORDED",
+    "UNRECORDED_EVENT",
+    "UNREADABLE",
+    "UNREADABLE_EVENT",
     "UnsupportedLedgerSchemaVersion",
+    "check_running_version",
     "ledger_path",
     "main",
     "record_schema_version",

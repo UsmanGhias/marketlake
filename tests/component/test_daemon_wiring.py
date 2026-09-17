@@ -13,7 +13,7 @@ test is a page a person receives, and a sync from one copies a throwaway lake on
 machine running the suite. So the tier is component: the daemon over real files, with the
 clock, the calendar, the network, and the backup still fake.
 
-Thirteen bindings are covered here.
+Fourteen bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live overrun records the minutes
    it slept through.
@@ -56,6 +56,10 @@ Thirteen bindings are covered here.
     field pages the minute the parser sees it. The observer carries state between cycles,
     so the binding also decides whether a drift that persists pages once or once a minute,
     and only the production entry can be asked that.
+14. Startup reaches the schema-version check, so a daemon started on a version the lake's
+    ledger has no shape for pages instead of capturing in silence. The binding decides two
+    things nothing else can: that the check reports rather than refusing to start, and that
+    it speaks once for the process rather than once a tick.
 """
 
 from __future__ import annotations
@@ -65,14 +69,14 @@ import sys
 import urllib.error
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from lake import capture, close_guard, daemon, gap, journal, report
+from lake import capture, close_guard, daemon, gap, journal, report, schema_versions
 from lake.alert import PAGE_PRIORITY, Message
 from lake.capture import CycleResult, SegmentError, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
@@ -83,6 +87,7 @@ from lake.deadman import CAPTURE_SLUG
 from lake.paths import LakePaths
 from lake.runner import PING_REFUSED_EVENT
 from lake.schema_drift import SCHEMA_DRIFT_EVENT, SCHEMA_DRIFT_TITLE
+from lake.schema_versions import check_running_version, ledger_path
 from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TickersError
@@ -90,8 +95,9 @@ from lake.vendor import VendorResponse
 from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
-from tests.support.config import PING_KEY, write_config
+from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
 from tests.support.pinger import FakePinger
+from tests.support.schema_version import record_running_version
 
 # The Monday of the week these runs live in. Its sessions run Monday through Friday,
 # each opening at 09:30 and closing at 16:00, so the option close lands at 16:15.
@@ -218,6 +224,11 @@ def _rig(
     """
     lake_root = tmp_path / "lake"
     lake_root.mkdir()
+    # A production lake records the running schema version, and the daemon pages at startup
+    # when it does not, which is marketlake #130. A rig without one would put that page in
+    # front of every case here, so the fixture models the machine rather than the empty
+    # directory. ``test_schema_versions.py`` drives the lake that has no ledger.
+    record_running_version(lake_root)
     tickers = tmp_path / "tickers.yaml"
     tickers.write_text(roster)
     return _Rig(
@@ -1989,3 +2000,229 @@ def test_an_ordinary_session_sends_no_schema_drift_page(tmp_path):
     _run(rig, clock, ticks=4, cycle_runner=_Drifting(rig, clock, drifting_on=[]))
 
     assert _drift_pages(rig) == []
+
+
+# -- 14. the startup schema-version check ---------------------------------------------
+
+
+def _version_pages(rig: _Rig) -> list[Message]:
+    """Every page the startup check sent, told apart from the rest by event."""
+    return [
+        page
+        for page in rig.transport.sent
+        if page.event
+        in {
+            schema_versions.UNRECORDED_EVENT,
+            schema_versions.CONFLICT_EVENT,
+            schema_versions.UNREADABLE_EVENT,
+        }
+    ]
+
+
+def test_a_daemon_started_on_a_version_the_ledger_does_not_know_pages_and_keeps_capturing(
+    tmp_path,
+):
+    """Marketlake #130's whole point, driven through the production entry.
+
+    On 2026-09-17 the daemon restarted at 01:32 onto a tree whose ``SCHEMA_VERSION`` the
+    ledger had never heard of, and said nothing. Every read of the rows it went on to write
+    refused, and nobody knew until a person read the lake twelve hours later.
+
+    It pages and it does not refuse to start. A daemon that will not start captures nothing,
+    and under ``KeepAlive`` the successor reaches the same check, so a missing row in a
+    reference table would cost the whole session. The loop running here is the half that is
+    easy to break by fixing the other one.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).unlink()
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+
+    (page,) = _version_pages(rig)
+    assert page.event == schema_versions.UNRECORDED_EVENT
+    assert page.priority == PAGE_PRIORITY
+    assert str(journal.SCHEMA_VERSION) in page.body
+    # The title is the first thing read on a locked phone, and ``alert._record`` keeps it on
+    # every failure but a refusal. A constant title would satisfy a test that only asked for
+    # the machine path to be absent from it.
+    assert page.title == check_running_version(rig.lake_root).title
+    assert str(journal.SCHEMA_VERSION) in page.title
+    # The loop ticked every minute it was given, which is what "report, never refuse"
+    # means. These ticks sit an hour before the open, so the dead-man's idle heartbeat is
+    # what shows the loop is alive rather than a cycle.
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+
+
+def test_the_startup_page_goes_out_once_however_long_the_daemon_lives(tmp_path):
+    """Once per process, because the check runs once and the condition cannot change in one.
+
+    The recurring reminder is the vendor sweep's report line. A page a night, or a page a
+    minute, until someone runs a command is its own outage.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).unlink()
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=30, cycle_runner=_no_cycle)
+
+    assert len(_version_pages(rig)) == 1
+
+
+def test_a_daemon_started_on_a_recorded_version_says_nothing(tmp_path):
+    """The steady state, and the case that decides whether this page is noise.
+
+    ``_rig`` records the running version because a production lake has it recorded, so every
+    other case in this file drives this branch too.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+
+    assert _version_pages(rig) == []
+
+
+def test_a_version_recorded_under_a_different_shape_pages_under_its_own_event(tmp_path):
+    """The silent half of the condition, which no read-time refusal reaches.
+
+    ``project_extra`` asks the ledger ``has_column`` and never compares the recorded shape
+    against the running one, so a version recorded too wide reports nothing and the read comes
+    back whole while a dropped column's nulls read as vendor nulls. The event is its own,
+    because ``alert._record`` keeps no body and the three verdicts name three repairs.
+    """
+    rig = _rig(tmp_path)
+    shapes = {
+        surface: dict(columns)
+        for surface, columns in schema_versions.running_fingerprints().items()
+    }
+    shapes[journal.CHAINS_SURFACE]["gamma_impact"] = "double"
+    schema_versions.SchemaVersionLedger(
+        [
+            schema_versions.RecordedVersion(
+                version=journal.SCHEMA_VERSION,
+                recorded_at=datetime(2026, 9, 13, 15, 0, tzinfo=UTC),
+                fingerprints=shapes,
+            )
+        ]
+    ).write(ledger_path(rig.lake_root))
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+
+    (page,) = _version_pages(rig)
+    assert page.event == schema_versions.CONFLICT_EVENT
+    assert "gamma_impact" in page.body
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+
+
+def test_the_startup_page_carries_no_machine_path(tmp_path):
+    """A phone cannot reach a local path, and a page that fails to send is written into a
+    directory the dashboard may read. The lake-relative name goes on the wire and the
+    absolute one goes to the launchd log.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).unlink()
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    (page,) = _version_pages(rig)
+    assert schema_versions.LEDGER_PARTITION in page.body
+    assert str(rig.lake_root) not in page.body
+    assert str(rig.lake_root) not in page.title
+
+
+def test_an_unreadable_ledger_pages_under_its_own_event(tmp_path):
+    """The third verdict, and the only site that reports it on a session day.
+
+    ``sweep`` computes the same verdict and loses it with the rest of the run, because
+    ``_LEDGER_REFUSALS`` does not name ``SchemaVersionsError``. That is marketlake #494. Until
+    it lands, this binding is the whole of what says a corrupt ledger exists, and the file it
+    names is the one the next backup copies over the last good copy.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).write_bytes(b"not parquet at all")
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=4, cycle_runner=_no_cycle)
+
+    (page,) = _version_pages(rig)
+    assert page.event == schema_versions.UNREADABLE_EVENT
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+
+
+def test_the_uncapped_detail_reaches_the_log_the_operator_is_sent_to(tmp_path, capsys):
+    """stderr is the only surface carrying the absolute path and the uncapped rendering.
+
+    The page body is cut at ``PAGE_COLUMN_CAP`` for the design's byte budget and the nightly
+    report line keeps capture-machine paths out of a file the dashboard may read. So a line
+    deleted here leaves the operator with the capped page and no way to reach the rest.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).unlink()
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    printed = capsys.readouterr().err
+    assert str(ledger_path(rig.lake_root)) in printed
+    assert str(journal.SCHEMA_VERSION) in printed
+
+
+class _BrokenTransport:
+    """A ``Transport`` whose POST never lands, standing for ntfy being unreachable."""
+
+    def __init__(self) -> None:
+        self.sent: list[Message] = []
+
+    def send(self, message: Message) -> None:
+        raise urllib.error.URLError("no route to host")
+
+
+def test_a_startup_page_that_never_left_the_laptop_says_so_in_the_log(tmp_path, capsys):
+    """The design's rule that a page which did not reach the phone must never be invisible.
+
+    ``Publisher`` writes it down under ``reports/alerts/`` either way, and that record is what
+    the Now panel counts. The line on stderr is what a person reading the launchd log after a
+    deploy sees, and without it a lost page leaves that log silent about a condition every
+    read of the lake is already refusing over.
+    """
+    rig = replace(_rig(tmp_path), transport=_BrokenTransport())
+    ledger_path(rig.lake_root).unlink()
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    printed = capsys.readouterr().err
+    assert "schema_version: page not sent" in printed
+    assert "written down" in printed, "a page nobody recorded is a page lost twice"
+
+
+def test_a_page_the_publisher_refuses_does_not_get_its_body_printed_instead(tmp_path, capsys):
+    """The bargain ``_page_sunday_daemon_finding`` already makes, held here too.
+
+    A publisher answers ``REFUSED`` when it finds one of its own secrets in a page, and it
+    redacts its record for that reason. Printing the fuller detail afterwards would undo the
+    redaction in the launchd log, which is a file on the same machine. So the refusal ends the
+    reporting rather than falling through to stderr.
+
+    The topic is the secret here, and it is set to a string the body already carries, which is
+    how a real body could ever come to contain one.
+    """
+    rig = _rig(tmp_path)
+    ledger_path(rig.lake_root).unlink()
+    config = rig.config.read_text().replace(
+        f"ntfy_topic: {NTFY_TOPIC}\n", "ntfy_topic: schema_version\n"
+    )
+    rig.config.write_text(config)
+    clock = ManualClock(start=et(2026, 9, 2, 8, 29, 30))
+
+    _run(rig, clock, ticks=2, cycle_runner=_no_cycle)
+
+    printed = capsys.readouterr().err
+    assert "page refused: it carried a secret" in printed
+    # The detail names the absolute ledger path and, on a conflict, every column that moved.
+    # Neither may follow a refusal.
+    assert str(rig.lake_root) not in printed
+    assert rig.transport.sent == []

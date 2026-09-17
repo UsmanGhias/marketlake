@@ -39,7 +39,13 @@ from lake.config import GuardConstants
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
 from lake.manifest import append_quarantine
 from lake.paths import CHAINS, QUOTES, LakePaths
-from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
+from lake.schema_versions import (
+    LEDGER_PARTITION,
+    LedgerUnreadable,
+    RecordedVersion,
+    SchemaVersionLedger,
+    running_fingerprints,
+)
 from lake.schwab import VendorAuthError
 from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
 from lake.sweep import DIGEST_BYTE_CAP, HOLIDAY_BODY, NIGHTLY_EVENT, NIGHTLY_PRIORITY
@@ -125,8 +131,25 @@ def _quotes_table(rows: list[dict]) -> pa.Table:
 
 
 def _ledger_table() -> pa.Table:
+    """The fixture lake's schema-version ledger, holding two entries.
+
+    The first describes the version the fixture's rows are stamped with, which is 1 until
+    marketlake #360 takes the fixture to the pinned constant, so the literal stays where that
+    sweep will find it.
+
+    The second is the running version, and it is here because marketlake #130 put a check for
+    it on this job. A sweep run against a lake whose running version is unrecorded files a
+    report line saying so, which is the job working and which every case here would then carry.
+    It is derived rather than spelled, so it cannot lag the pinned constant. When the two
+    versions are the same integer the second simply replaces the first.
+    """
     entry = RecordedVersion(version=1, recorded_at=RECORDED_AT, fingerprints=running_fingerprints())
-    return SchemaVersionLedger([entry]).to_table()
+    running = RecordedVersion(
+        version=journal.SCHEMA_VERSION,
+        recorded_at=RECORDED_AT,
+        fingerprints=running_fingerprints(),
+    )
+    return SchemaVersionLedger([entry, running]).to_table()
 
 
 def _master(tickers: tuple[str, ...] = ("SPY",)) -> SecurityMaster:
@@ -242,6 +265,7 @@ def _lake(
     chains: dict[tuple[str, date], pa.Table] | None = None,
     tickers: tuple[str, ...] = ("SPY",),
     instrument_ids: tuple[int, ...] = (1,),
+    ledger: pa.Table | None = None,
 ) -> Path:
     """A lake holding the next session's sealed quotes, the ledger, the master and the spans.
 
@@ -249,6 +273,10 @@ def _lake(
     could not tell whether capture was running. A fixture without them exercises the wiring
     only in the mode where the battery judges nothing, which is the one mode that cannot show
     the wiring working.
+
+    ``ledger`` replaces the schema-version ledger. The default records the running version,
+    because a production lake has it recorded and marketlake #130 put a check for that on this
+    job. A case about that check passes one that does not.
     """
     if quotes is None:
         quotes = {("SPY", FOLLOWING): [_quote_row(FOLLOWING)]}
@@ -256,7 +284,7 @@ def _lake(
         fixture_lake.with_quotes(ticker, day, _quotes_table(rows))
     for (ticker, day), table in (chains or {}).items():
         fixture_lake.with_chains(ticker, day, table)
-    fixture_lake.with_reference("schema_versions", _ledger_table())
+    fixture_lake.with_reference("schema_versions", _ledger_table() if ledger is None else ledger)
     fixture_lake.with_reference("capture_spans", _spans(instrument_ids).to_table())
     root = fixture_lake.build()
     _master(tickers).write(master_path(root))
@@ -2186,3 +2214,179 @@ def test_the_nightly_reports_a_run_that_deferred_exactly_one_ticker_day(
     assert line == f"bars deferred: 1 ticker-day(s), {len(walked) - 1} request(s) spent"
     assert line in outcome.digest.body
     assert pinger.urls == [PING_URL]
+
+
+# -- the schema-version check ------------------------------------------------------------
+
+# Marketlake #130. Nothing forces ``python -m lake.schema_versions`` to run beside a deliberate
+# bump, and a version whose shape the lake has no record of makes every read of its rows
+# refuse. The daemon pages once at its own startup. This job is the recurring half, and it is
+# owed one because a resident daemon carries the tree it was started with: a deploy with no
+# restart lands the new version from this process, since ``backfill_bars`` stamps
+# ``journal.SCHEMA_VERSION`` on every bar it writes.
+
+
+def _stale_ledger() -> pa.Table:
+    """A ledger recording the version before the running one, which is the live 2026-09-17
+    shape: version 1 recorded on 2026-09-13 and version 2 running since a bump nobody
+    recorded."""
+    entry = RecordedVersion(
+        version=journal.SCHEMA_VERSION - 1,
+        recorded_at=RECORDED_AT,
+        fingerprints=running_fingerprints(),
+    )
+    return SchemaVersionLedger([entry]).to_table()
+
+
+def _version_lines(outcome) -> list[str]:
+    return [line for line in outcome.nightly.report if line.startswith("schema_version")]
+
+
+def test_a_run_whose_version_the_ledger_does_not_know_files_a_line_and_still_pings(
+    fixture_lake: FixtureLake,
+):
+    """Report-tier, not a problem, which is ``_counted``'s line from the other side.
+
+    The work the ``eod-sweep`` check watches did happen. A check that withheld the ping over
+    a reference table nobody had written would turn a job that worked into a red row, and the
+    red row means the day's official bars or actions are missing.
+    """
+    root = _lake(fixture_lake, ledger=_stale_ledger())
+
+    outcome, pinger, _ = _run(root)
+
+    (line,) = _version_lines(outcome)
+    assert str(journal.SCHEMA_VERSION) in line
+    assert outcome.nightly.problems == ()
+    assert pinger.urls == [PING_URL]
+
+
+def test_the_line_repeats_on_a_holiday_because_the_condition_is_not_a_walk(
+    fixture_lake: FixtureLake,
+):
+    """A holiday skips the three walks and this is not a walk.
+
+    The condition does not depend on the session and the report file is written on every run,
+    holiday no-op included. Put beside the walks it would go quiet on every holiday, which is
+    the run most likely to follow a deploy.
+    """
+    root = _lake(fixture_lake, ledger=_stale_ledger())
+
+    outcome, pinger, transport = _run(root, holidays=(SESSION,))
+
+    assert outcome.nightly.session is False
+    assert len(_version_lines(outcome)) == 1
+    assert pinger.urls == [PING_URL]
+    # The digest still sends the design's pinned holiday line and nothing else, so the file
+    # is the only surface a holiday finding reaches.
+    assert transport.messages[0].body == HOLIDAY_BODY
+
+
+def test_the_line_reaches_the_report_file_and_the_digest(fixture_lake: FixtureLake):
+    """Two surfaces, and the digest is the one with a rule attached.
+
+    ``digest_body`` passes every report line through ``report.redacted``, which drops
+    everything past the second colon-separated field. A line composed as a place, then a
+    verdict, then a version would reach the phone with the version gone.
+    """
+    root = _lake(fixture_lake, ledger=_stale_ledger())
+
+    outcome, _, transport = _run(root)
+
+    (filed,) = _filed(root)
+    (line,) = _version_lines(outcome)
+    assert line in filed["report"]
+    assert f"report: {line}" in transport.messages[0].body
+    assert str(journal.SCHEMA_VERSION) in transport.messages[0].body
+
+
+def _conflicting_ledger() -> pa.Table:
+    """The running version recorded under a shape the running code does not have.
+
+    A column the ledger holds and the code dropped, which is the direction no read-time
+    refusal can see: it falls outside the projection's reachable set, so the read comes back
+    whole while the dropped column's nulls read as vendor nulls.
+    """
+    shapes = {surface: dict(columns) for surface, columns in running_fingerprints().items()}
+    shapes[journal.CHAINS_SURFACE]["gamma_impact"] = "double"
+    entry = RecordedVersion(
+        version=journal.SCHEMA_VERSION, recorded_at=RECORDED_AT, fingerprints=shapes
+    )
+    return SchemaVersionLedger([entry]).to_table()
+
+
+def test_a_conflicting_ledger_files_its_own_line(fixture_lake: FixtureLake):
+    """The second verdict, and it is not the one the other cases here drive.
+
+    Every case above builds a stale ledger, so a caller that filed a line for `unrecorded`
+    alone would leave the two verdicts that compound unreported and pass all of them. This is
+    the worse of the two, because nothing at read time refuses it.
+    """
+    root = _lake(fixture_lake, ledger=_conflicting_ledger())
+
+    outcome, pinger, _ = _run(root)
+
+    (line,) = _version_lines(outcome)
+    assert "different shape" in line
+    assert outcome.nightly.problems == ()
+    assert pinger.urls == [PING_URL]
+
+
+def test_a_run_against_a_recorded_version_files_no_line(fixture_lake: FixtureLake):
+    """The steady state, and the case that decides whether this line is noise.
+
+    ``_ledger_table`` records the running version, so every other case in this file drives
+    this branch and would go red on a line that fired unconditionally.
+    """
+    root = _lake(fixture_lake)
+
+    outcome, _, _ = _run(root)
+
+    assert _version_lines(outcome) == []
+
+
+def test_the_line_carries_no_machine_path(fixture_lake: FixtureLake):
+    """``report.redacted`` exists because this file sits in the directories the dashboard may
+    read, so a capture-machine path stops at stderr."""
+    root = _lake(fixture_lake, ledger=_stale_ledger())
+
+    outcome, _, _ = _run(root)
+
+    (line,) = _version_lines(outcome)
+    assert LEDGER_PARTITION in line
+    assert str(root) not in line
+
+
+def test_an_unreadable_ledger_reaches_the_report_on_a_holiday_and_nowhere_else_yet(
+    fixture_lake: FixtureLake,
+):
+    """The third verdict, and the bound marketlake #494 puts on it.
+
+    A holiday opens no reference file, so the check is the only reader of the ledger and its
+    line lands. A session evening does not get that far: ``_LEDGER_REFUSALS`` does not name
+    ``SchemaVersionsError``, so ``extract_dividends`` lets ``LedgerUnreadable`` out and it
+    escapes ``sweep`` with the report file, the digest and the ping. The line is computed and
+    lost with them.
+
+    That escape predates the check and is #494's to close. This case is here so the bound is
+    written down where the next reader meets it, and so the day #494 lands turns the second
+    half of this test red rather than leaving it to be noticed.
+
+    The daemon's startup check reports the same verdict meanwhile, which is
+    ``test_daemon_wiring.test_an_unreadable_ledger_pages_under_its_own_event``.
+    """
+    root = _lake(fixture_lake)
+    (root / "reference" / "schema_versions.parquet").write_bytes(b"not parquet at all")
+
+    outcome, pinger, _ = _run(root, holidays=(SESSION,))
+
+    (line,) = _version_lines(outcome)
+    assert "LedgerUnreadable" in line
+    assert pinger.urls == [PING_URL]
+
+    # And the session evening, which does not survive to file anything. The holiday run above
+    # already filed one, so what this counts is that the second run added none.
+    before = len(_filed(root))
+    with pytest.raises(LedgerUnreadable):
+        _run(root)
+    assert len(_filed(root)) == before, "the run that raised must not have filed a report"
