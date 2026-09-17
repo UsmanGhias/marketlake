@@ -3157,6 +3157,14 @@ def test_the_panel_forwards_the_alarm_flag_it_was_given(root: Path, monkeypatch)
             beyond_horizon=False,
         )
 
+    # Unpatched first. The fixture lake's runway outruns the calendar, so this is the
+    # ``True`` side of the flag, and asserting only the ``False`` side below would let a
+    # literal ``False`` sit in the payload undetected.
+    plain = service_over(root).run_query("lake", {})
+    assert plain["beyond_horizon"] is True
+    assert plain["exhausts_on"] is None
+    assert plain["short"] is False
+
     monkeypatch.setattr(dashboard, "assess", short_runway)
     payload = service_over(root).run_query("lake", {})
     assert payload["short"] is True
