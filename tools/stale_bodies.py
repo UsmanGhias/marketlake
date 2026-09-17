@@ -199,18 +199,10 @@ def _fetch_closes(repo: str, number: int) -> list[int]:
     return [int(ref["number"]) for ref in payload.get("closingIssuesReferences", [])]
 
 
-def _fetch_open_issues(repo: str) -> list[dict[str, object]]:
-    """Every open issue, or a refusal.
+_LIMIT = 2000
 
-    A short list is the failure this module exists to prevent, arriving from inside the
-    module. ``gh issue list --limit 5`` returns five and says nothing about the rest, so
-    the count is checked twice: against the limit, which catches a cap, and against
-    ``totalCount``, which catches a short page. The list is read before the count, so an
-    issue closing in between lowers ``totalCount`` and cannot cause a false refusal. An
-    issue opening in between can, and that trade is deliberate: a false refusal is one
-    loud re-runnable job, and a dropped candidate is silent.
-    """
-    limit = 2000
+
+def _list_open_issues(repo: str) -> list[dict[str, object]]:
     raw = _gh(
         [
             "issue",
@@ -220,12 +212,15 @@ def _fetch_open_issues(repo: str) -> list[dict[str, object]]:
             "--state",
             "open",
             "--limit",
-            str(limit),
+            str(_LIMIT),
             "--json",
             "number,title,body,state",
         ]
     )
-    issues = json.loads(raw)
+    return list(json.loads(raw))
+
+
+def _count_open_issues(repo: str) -> int:
     owner, _, name = repo.partition("/")
     owner_literal, name_literal = json.dumps(owner), json.dumps(name)
     query = (
@@ -233,18 +228,41 @@ def _fetch_open_issues(repo: str) -> list[dict[str, object]]:
         "{issues(states:OPEN){totalCount}}}"
     )
     total = json.loads(_gh(["api", "graphql", "-f", f"query={query}"]))
-    expected = int(total["data"]["repository"]["issues"]["totalCount"])
-    if len(issues) >= limit:
-        raise StaleBodiesError(
-            f"the open-issue listing hit its {limit} limit, so it is truncated and "
-            "would drop candidates silently"
+    return int(total["data"]["repository"]["issues"]["totalCount"])
+
+
+def _fetch_open_issues(repo: str) -> list[dict[str, object]]:
+    """Every open issue, or a refusal.
+
+    A short list is the failure this module exists to prevent, arriving from inside the
+    module, so the count is checked twice. Against the limit, which catches a cap:
+    ``gh issue list --limit 5`` returns five and says nothing about the rest. And against
+    ``totalCount``, which catches a short page.
+
+    The second check races, and the race is not hypothetical. This module's own first run
+    refused with "returned 111 of 112" because another session filed an issue between the
+    listing and the count. A guard that refuses whenever somebody files an issue is a
+    guard whose reader turns it off, which is the failure this whole module is built
+    around. So a shortfall is read once more before it is believed. A race resolves on the
+    second attempt, because the new issue is in the second listing. A genuinely short page
+    repeats.
+    """
+    shortfall = ""
+    for _ in range(2):
+        issues = _list_open_issues(repo)
+        if len(issues) >= _LIMIT:
+            raise StaleBodiesError(
+                f"the open-issue listing hit its {_LIMIT} limit, so it is truncated and "
+                "would drop candidates silently"
+            )
+        expected = _count_open_issues(repo)
+        if len(issues) >= expected:
+            return issues
+        shortfall = (
+            f"the open-issue listing returned {len(issues)} of {expected} twice, so it "
+            "is short and would drop candidates silently"
         )
-    if len(issues) < expected:
-        raise StaleBodiesError(
-            f"the open-issue listing returned {len(issues)} of {expected}, so it is "
-            "short and would drop candidates silently"
-        )
-    return issues
+    raise StaleBodiesError(shortfall)
 
 
 def _find_marker_comment(repo: str, number: int) -> int | None:

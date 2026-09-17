@@ -12,6 +12,8 @@ issue's, and such a test could not fail.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tools.stale_bodies import MARKER, Candidate, StaleBodiesError, candidates, references, render
@@ -102,30 +104,72 @@ def test_a_null_body_names_nothing() -> None:
     assert candidates(pull_body=None, closes=[], issues=[_issue(1)], repo=REPO) == []
 
 
-def test_a_short_listing_is_refused_with_one_named_line() -> None:
+def _fake_fetch(
+    monkeypatch: pytest.MonkeyPatch, listings: list[str], counts: list[int]
+) -> list[str]:
+    """Drive ``_fetch_open_issues`` through a scripted pair of listings and counts."""
+    from tools import stale_bodies
+
+    seen: list[str] = []
+
+    def fake_gh(args: list[str]) -> str:
+        seen.append(args[0])
+        if args[0] == "issue":
+            return listings.pop(0)
+        return json.dumps({"data": {"repository": {"issues": {"totalCount": counts.pop(0)}}}})
+
+    monkeypatch.setattr(stale_bodies, "_gh", fake_gh)
+    return seen
+
+
+def _rows(count: int) -> str:
+    return json.dumps(
+        [{"number": n, "title": "t", "body": "", "state": "OPEN"} for n in range(count)]
+    )
+
+
+def test_a_listing_short_twice_is_refused_with_one_named_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test 9. A truncated listing drops candidates in exactly the silent way this catches."""
     from tools import stale_bodies
 
-    calls: list[list[str]] = []
-
-    def fake_gh(args: list[str]) -> str:
-        calls.append(args)
-        if args[0] == "issue":
-            return '[{"number": 1, "title": "t", "body": "", "state": "OPEN"}]'
-        return '{"data": {"repository": {"issues": {"totalCount": 9}}}}'
-
-    original = stale_bodies._gh
-    stale_bodies._gh = fake_gh  # type: ignore[assignment]
-    try:
-        with pytest.raises(StaleBodiesError) as caught:
-            stale_bodies._fetch_open_issues(REPO)
-    finally:
-        stale_bodies._gh = original  # type: ignore[assignment]
-    assert "returned 1 of 9" in str(caught.value)
+    seen = _fake_fetch(monkeypatch, [_rows(1), _rows(1)], [9, 9])
+    with pytest.raises(StaleBodiesError) as caught:
+        stale_bodies._fetch_open_issues(REPO)
+    assert "returned 1 of 9 twice" in str(caught.value)
     assert len(str(caught.value).splitlines()) == 1
-    # The listing is read before the count, so an issue closing in between lowers the
-    # count and cannot cause a false refusal.
-    assert [call[0] for call in calls] == ["issue", "api"]
+    assert seen == ["issue", "api", "issue", "api"]
+
+
+def test_a_listing_short_once_is_read_again_rather_than_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test 13. An issue filed mid-run is a race, not a truncation.
+
+    This module's own first run refused with "returned 111 of 112" because another
+    session filed an issue between the listing and the count. A guard that refuses
+    whenever somebody files an issue is a guard whose reader turns it off.
+    """
+    from tools import stale_bodies
+
+    seen = _fake_fetch(monkeypatch, [_rows(111), _rows(112)], [112, 112])
+    issues = stale_bodies._fetch_open_issues(REPO)
+    assert len(issues) == 112
+    assert seen == ["issue", "api", "issue", "api"]
+
+
+def test_a_listing_that_hits_its_limit_is_refused_without_a_second_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test 14. A cap is not a race, so it is refused on sight."""
+    from tools import stale_bodies
+
+    seen = _fake_fetch(monkeypatch, [_rows(stale_bodies._LIMIT)], [stale_bodies._LIMIT])
+    with pytest.raises(StaleBodiesError) as caught:
+        stale_bodies._fetch_open_issues(REPO)
+    assert "hit its 2000 limit" in str(caught.value)
+    assert seen == ["issue"]
 
 
 def test_a_title_carrying_a_pipe_keeps_its_column() -> None:
