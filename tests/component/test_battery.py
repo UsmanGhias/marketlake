@@ -71,11 +71,14 @@ from lake.capture_spans import CaptureSpan
 from lake.config import GuardConstants
 from lake.manifest import (
     CLEAN_VERDICT,
+    QUARANTINE_FILE,
+    LedgerNotUtf8,
     ManifestError,
     TornLedger,
     append_line,
     append_quarantine,
     is_quarantined,
+    latest_entries,
     latest_quarantine,
     latest_quarantine_by_check,
     quarantine_path,
@@ -372,6 +375,136 @@ def test_the_manifest_row_count_follows_the_file_and_never_shrinks(lake: Path):
         observed_at=NOW,
     )
     assert entry_line_count(lake) == 5
+
+
+def test_the_row_count_answers_on_a_ledger_every_reader_refuses(lake: Path):
+    """Site 4 of marketlake #499, and the design doc's own sentence answered rather than cut.
+
+    ``docs/design.md`` places this count outside ``manifest.read_quarantine``'s refusals
+    "because it counts lines for the manifest row count and resolves nothing, and a count on the
+    write path must not refuse". That was written about a torn ledger, where a direct read still
+    answers. A file that will not decode broke its premise: ``read_text`` gave the count no text
+    to count, so the count raised where the doc said it must not.
+
+    The raise landed inside ``write_verdict``, after ``append_line`` and before
+    ``record_partition``, so it left the ledger a line longer than the manifest entry that
+    describes it. That split is marketlake #523, and the assertions below are the half of it this
+    change removes: the count answers, so the pair is written.
+    """
+    append_verdict(
+        lake,
+        build_entry(
+            partition="chains/ticker=SPY/date=2026-09-16.parquet",
+            verdict=QUARANTINED_VERDICT,
+            check=CHECK_ENTITLEMENT,
+            observed_at=NOW,
+        ),
+        observed_at=NOW,
+    )
+    ledger = lake / "quarantine.jsonl"
+    raw = ledger.read_bytes()
+    assert raw.count(b'"battery"') == 1, "the fixture no longer says what it meant to"
+    ledger.write_bytes(raw.replace(b'"battery"', b'"batter\xff"'))
+
+    with pytest.raises(LedgerNotUtf8):
+        read_quarantine(lake)
+    assert entry_line_count(lake) == 1, "the count stopped answering"
+
+    # The pair, which is what the count answering buys. Without it the append below lands its
+    # line and the manifest entry describing it never gets written.
+    append_verdict(
+        lake,
+        build_entry(
+            partition="chains/ticker=QQQ/date=2026-09-16.parquet",
+            verdict=QUARANTINED_VERDICT,
+            check=CHECK_ENTITLEMENT,
+            observed_at=NOW,
+        ),
+        observed_at=NOW,
+    )
+    assert len(ledger.read_bytes().splitlines()) == 2
+    assert latest_entries(lake)[QUARANTINE_FILE]["rows"] == 2
+
+
+def test_the_row_count_decodes_utf8_rather_than_the_locales_encoding(lake: Path, monkeypatch):
+    """``read_text`` with no argument decodes in the locale's encoding, and this does not.
+
+    Python 3.12 turns UTF-8 mode on by itself under a C locale, so this cannot be driven by
+    setting one from inside the process. The read is asserted directly instead: a ledger holding
+    a valid non-ASCII character, which ``read_text`` refuses under ``LC_ALL=C`` with
+    ``-X utf8=0`` and this counts.
+
+    A replacement can only substitute inside a line, never split one, so the count is the same
+    number on every file that used to decode. That is the property counting over the raw bytes
+    would lose, and ``actions.entry_line_count``'s sibling test measures the gap.
+    """
+    reason = "vendor said \u201chalt\u201d for C\u00e9line"
+    entry = {"partition": "p", "check": "e", "verdict": QUARANTINED_VERDICT, "reason": reason}
+    ledger = lake / "quarantine.jsonl"
+    ledger.write_bytes(
+        (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+
+    assert max(ledger.read_bytes()) > 127, "the fixture stopped being the case"
+
+    def refuse(*args, **kwargs):  # pragma: no cover - the call under test must not reach it
+        raise AssertionError("the count read text in the locale's encoding")
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    assert entry_line_count(lake) == 1
+
+
+def test_counting_the_quarantine_ledger_over_raw_bytes_would_let_the_count_fall(lake: Path):
+    """The twin of ``actions``'s own test, on the second of the two counts this rule covers.
+
+    ``bytes.splitlines`` splits on fewer separators than ``str.splitlines``, so a hand edit
+    holding ``U+2028`` inside a field counts one line over the bytes where it counts two over the
+    text. A count that falls is exactly what ``manifest.guard_row_count`` raises on, and the raise
+    would land after ``append_line`` had already written the line.
+
+    ``actions.entry_line_count`` has held this since marketlake #499 and this function carries the
+    reasoning by reference alone, so a mutation review found the raw-byte count surviving here
+    while the identical mutation died there. The byte count is computed in the test rather than
+    described, so the gap it avoids is a measurement.
+    """
+    raw = (
+        json.dumps({"partition": "p", "check": "e", "verdict": QUARANTINED_VERDICT}) + "\n"
+    ).encode("utf-8") + (
+        json.dumps({"partition": "q", "reason": "a\u2028b"}, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    (lake / "quarantine.jsonl").write_bytes(raw)
+
+    over_bytes = sum(1 for line in raw.splitlines() if line.strip())
+    assert over_bytes == 2, "the fixture stopped separating the two counts"
+    assert entry_line_count(lake) == 3
+
+
+def test_the_quarantine_count_skips_a_blank_line_a_hand_edit_left(lake: Path):
+    """A blank line is not a verdict, and this count is the manifest's row count.
+
+    No writer here makes one, so a file holding one is hand edited, which is the repair path every
+    message about a damaged ledger names. Counting it would inflate what the manifest says the
+    ledger holds. A mutation review found the filter removable with nothing failing, on both this
+    count and its ``actions`` twin.
+    """
+    for partition in ("p", "q"):
+        append_verdict(
+            lake,
+            build_entry(
+                partition=partition,
+                verdict=QUARANTINED_VERDICT,
+                check=CHECK_ENTITLEMENT,
+                observed_at=NOW,
+            ),
+            observed_at=NOW,
+        )
+    ledger = lake / "quarantine.jsonl"
+    lines = ledger.read_bytes().splitlines(keepends=True)
+    assert len(lines) == 2, "the fixture no longer says what it meant to"
+    ledger.write_bytes(lines[0] + b"\n" + b"   \n" + lines[1])
+
+    assert len(ledger.read_bytes().splitlines()) == 4
+    assert entry_line_count(lake) == 2
 
 
 # -- human precedence --------------------------------------------------------

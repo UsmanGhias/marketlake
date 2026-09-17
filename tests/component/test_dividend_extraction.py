@@ -1478,3 +1478,66 @@ def test_an_absent_master_raises_rather_than_holding_one_finding_per_ticker_day(
         extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
 
     assert _findings(root, DAY_ONE) == []
+
+
+def test_the_command_against_an_undecodable_actions_ledger_is_a_line_and_not_a_stack(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """Marketlake #499's operator surface, which is the half the nightly run did not need.
+
+    ``sweep._LEDGER_REFUSALS`` names ``ActionsError`` as the class, so the 18:30 walk contained
+    the new refusal on the day it was written. This command did not: ``actions.main`` catches
+    ``MasterAbsent``, ``MasterUnreadable`` and ``ManifestError``, and nothing else from this
+    module's family, so the refusal arrived as a stack.
+
+    The handler names the new class alone rather than ``ActionsError``, because the family's
+    other members are not run-ending conditions. ``UnresolvedSymbol`` is a per-ticker-day finding
+    the walk already holds, ``LedgerLineError`` names one entry rather than the file, and the two
+    master errors have their own arms with their own repairs. Catching the base class would print
+    one sentence about a ledger for all four.
+    """
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    ledger = actions.actions_path(root)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b'{"instrument_id": 1, "ex_date": "2026-06-18", "type": "divid\xffnd"}\n')
+    config = write_config(tmp_path, root)
+
+    code = actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert code == 2
+    printed = capsys.readouterr().err
+    assert "Traceback" not in printed
+    assert printed.startswith("actions: ")
+    assert str(ledger) in printed, "the line does not say which file to open"
+    assert "not valid UTF-8" in printed
+    assert "Repair it by hand under the lake-root lock" in printed
+
+
+def test_the_command_still_shows_a_stack_for_a_ledger_line_it_cannot_resolve(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    """The negative half of the arm above, which decides how wide that ``except`` may be.
+
+    ``actions.main`` catches ``LedgerNotUtf8`` alone rather than ``ActionsError``, because the
+    family's other members are not run-ending conditions. ``LedgerLineError`` names one entry
+    rather than the file, so a reader meeting it wants the frames that say which entry, and the
+    ledger's repair sentence would be the wrong advice about the wrong scope.
+
+    A mutation review widened that arm to ``ActionsError`` and the whole suite stayed green,
+    because the sibling above asserts only the positive case. A test that pins what a handler
+    catches and never what it declines holds half a boolean.
+    """
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    ledger = actions.actions_path(root)
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    # Decodable, parses as JSON, and names no usable key. That is ``LedgerLineError``, not this
+    # change's class, and it must keep its stack.
+    ledger.write_bytes(b'{"instrument_id": "not-an-int"}\n')
+    config = write_config(tmp_path, root)
+
+    with pytest.raises(actions.LedgerLineError):
+        actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert isinstance(actions.LedgerLineError("x", 1, "y"), actions.ActionsError), (
+        "the premise of this test is that both classes share a base"
+    )
