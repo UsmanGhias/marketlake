@@ -1,0 +1,66 @@
+# Name the open issue bodies a merge makes worth re-reading, per #393.
+#
+# It is its own workflow rather than a job in ci.yml, because ci.yml declares
+# "permissions: contents: read" at the workflow level and this one needs to write a
+# comment. A separate file leaves that declaration alone.
+name: Stale body candidates
+
+on:
+  pull_request:
+    # "edited" is here because a body edit fires no "synchronize", and both lookups read
+    # the body. Editing an open pull request's body is how a misparsed closing keyword
+    # gets corrected, so the candidate list has to be recomputed when it happens.
+    types: [opened, synchronize, reopened, edited, closed]
+
+permissions:
+  contents: read
+  issues: read
+  # Writing the comment. The design writes nothing to any issue, so "issues" stays read.
+  pull-requests: write
+
+concurrency:
+  # Two pushes in quick succession would otherwise have two runs each find no marker
+  # comment and each post one, which is the papering failure on a single pull request.
+  group: stale-bodies-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  candidates:
+    # A Dependabot body pastes upstream changelogs. This repo's one such pull request
+    # carries 74 "#NNN" references that name nothing here. The guard reads the author's
+    # type rather than github.actor, which a human pushing to a bot's branch changes.
+    if: github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    # The job makes four API calls and takes seconds. This ceiling only fires on a hang.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The default ref for a pull_request event is refs/pull/N/merge, and this repo
+          # deletes head branches on merge, which takes that ref with it. Not one /merge
+          # ref exists for any pull request here. The head sha survives.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Name the bodies worth re-reading
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # The body goes through the environment rather than into the script's text,
+          # because a pull request body is untrusted input and interpolating it would
+          # let it run as shell.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          if [ "$PR_ACTION" = "closed" ]; then
+            if [ "$PR_MERGED" = "true" ]; then state=merged; else state=abandoned; fi
+          else
+            state=open
+          fi
+          python3 -m tools.stale_bodies \
+            --pull "$PR_NUMBER" \
+            --state "$state" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
