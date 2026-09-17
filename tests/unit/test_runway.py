@@ -487,3 +487,148 @@ def test_a_missing_root_names_the_root_rather_than_its_absolute_path(tmp_path: P
     usage = walk(tmp_path / "not-a-lake")
     assert usage.refusals == ("the lake root: FileNotFoundError",)
     assert str(tmp_path) not in usage.refusals[0]
+
+
+# -- the constants, pinned rather than echoed --------------------------------
+
+
+def test_the_design_constants_are_pinned_to_their_literal_values():
+    """A test that computes its expectation from the constant moves with it and holds nothing.
+
+    ``HEADROOM_WEEKS`` is the threshold the nightly report flags at, and
+    ``test_headroom_under_the_threshold_is_short_and_a_day_over_it_is_not`` derives its own
+    boundary from it, so that test passes for any value. Changed to 1, a three-week runway
+    silently stops being flagged. The window and the refusal cap have the same shape.
+    """
+    assert HEADROOM_WEEKS == 3
+    assert runway.GROWTH_WINDOW_DAYS == 30
+    assert runway.NAMED_REFUSALS == 3
+    assert runway.MAX_FORWARD_DAYS == 366 * 2
+
+
+def test_a_runway_inside_the_forward_bound_still_gets_a_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # ``MAX_FORWARD_DAYS`` exists to stop a calendar that never refuses, not to withhold a
+    # date a reader could have had. A runway a couple of months out is inside every real
+    # calendar's horizon and must come back dated.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    calendar = _weekday_calendar(MONDAY, 400)
+    _stub_space(monkeypatch, free=0)
+    peak = assess(tmp_path, today=MONDAY, calendar=calendar).peak
+    _stub_space(monkeypatch, free=peak * 45)
+    result = assess(tmp_path, today=MONDAY, calendar=calendar)
+    assert result.capture_days_left == 45
+    assert result.exhausts_on is not None
+    assert result.beyond_horizon is False
+
+
+# -- the calendar's own refusal ----------------------------------------------
+
+
+class _BoundedCalendar:
+    """A calendar that raises past its horizon, the way ``exchange_calendars`` does.
+
+    ``FakeCalendar`` returns ``False`` for a day it does not know and never raises, so no
+    test built on it reaches the ``_CALENDAR_RANGE_ERRORS`` branch. The real adapter raises
+    ``DateOutOfBounds``, which is a ``ValueError``, and that is the case the branch exists
+    for.
+    """
+
+    def __init__(self, start: date, days: int) -> None:
+        self._start = start
+        self._last = start + timedelta(days=days)
+
+    def is_session(self, day: date) -> bool:
+        if day > self._last:
+            raise ValueError(f"date out of bounds: {day}")
+        return day.weekday() < 5
+
+
+def test_a_calendar_that_raises_past_its_horizon_is_contained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The real calendar refuses rather than answering False. Letting that escape turns the
+    # whole panel into a 500, which is the one outcome the module's containment rule
+    # forbids.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _stub_space(monkeypatch, free=1 << 45)
+    result = assess(tmp_path, today=MONDAY, calendar=_BoundedCalendar(MONDAY, 60))
+    assert result.beyond_horizon is True
+    assert result.exhausts_on is None
+    assert result.capture_days_left > 0
+
+
+# -- a file that will not stat ------------------------------------------------
+
+
+def _unsearchable(directory: Path):
+    """A directory that lists but whose children cannot be stat-ed, at mode 0o644.
+
+    This is the case ``os.walk``'s ``onerror`` never sees. The listing succeeds, so the
+    refusal surfaces on the per-file ``stat`` instead, which is a different clause.
+    """
+    directory.chmod(0o644)
+
+
+def test_a_file_that_will_not_stat_is_a_named_refusal_and_not_a_silent_loss(tmp_path: Path):
+    # The fail-open case the module exists to prevent, one clause over from the one the
+    # directory test covers. The bytes are missing either way, so the growth rate is
+    # understated and the runway lengthened. What must not also go missing is the line
+    # saying so.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    locked = tmp_path / "quotes" / "ticker=SPY"
+    _write(tmp_path, "quotes/ticker=SPY/date=2026-09-14.parquet", 10)
+    _unsearchable(locked)
+    try:
+        usage = walk(tmp_path)
+    finally:
+        locked.chmod(0o755)
+    assert usage.refused == 1
+    assert usage.refusals == ("quotes/ticker=SPY/date=2026-09-14.parquet: PermissionError",)
+
+
+def test_a_file_that_vanished_mid_walk_is_skipped_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The mirror of the test above, and it has to hold in the other direction. Compaction
+    # prunes an emptied directory while holding the lake lock, so this happens every
+    # weekday at close+15. Counting it as a refusal would light the panel up daily on a
+    # lake behaving exactly as designed.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    real = Path.stat
+
+    def vanishing(self: Path, *args: object, **kwargs: object):
+        if self.name == "date=2026-09-14.parquet":
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", vanishing)
+    usage = walk(tmp_path)
+    assert usage.refused == 0
+    assert usage.refusals == ()
+    assert usage.files == 0
+
+
+def test_a_day_whose_every_file_is_empty_is_not_a_capture_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A zero-length file occupies no blocks, so the day it names grew the lake by nothing.
+    # Counting it would halve the mean the panel prints beside the peak.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 400_000)
+    _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=SPY/seg-a.arrows", 0)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
+    assert result.capture_days == 1
+    assert result.mean == result.peak
+
+
+def test_each_entry_reports_its_own_file_count(tmp_path: Path):
+    # The count rides beside the bytes because a tree that is large by file count and small
+    # by bytes is the one whose allocated blocks diverge from its content.
+    for index in range(5):
+        _write(tmp_path, f"chains/ticker=SPY/date=2026-09-{10 + index}.parquet", 10)
+    _write(tmp_path, "manifest.jsonl", 10)
+    by_name = {entry.name: entry for entry in walk(tmp_path).entries}
+    assert by_name["chains"].files == 5
+    assert by_name["manifest.jsonl"].files == 1

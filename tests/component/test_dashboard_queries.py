@@ -39,6 +39,7 @@ import hashlib
 import json
 import shutil
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -3135,3 +3136,60 @@ def test_a_lake_with_no_growth_in_the_window_reports_no_runway(fixture_lake: Fix
     assert payload["exhausts_on"] is None
     assert payload["mean_bytes"] is None
     assert payload["short"] is False
+
+
+def test_the_panel_forwards_the_alarm_flag_it_was_given(root: Path, monkeypatch):
+    """The unit tests hold ``Runway.short``. Nothing held the panel passing it on.
+
+    ``status.html`` keys the alarm styling off exactly this field, so a wiring slip here
+    silences the headroom warning on the one page an operator opens to ask whether the disk
+    is filling. The same goes for ``beyond_horizon``, which the page branches on to decide
+    whether to print a date at all.
+    """
+    real = dashboard.assess
+
+    def short_runway(*args: object, **kwargs: object):
+        result = real(*args, **kwargs)
+        return replace(
+            result,
+            capture_days_left=1,
+            exhausts_on=result.window_end,
+            beyond_horizon=False,
+        )
+
+    monkeypatch.setattr(dashboard, "assess", short_runway)
+    payload = service_over(root).run_query("lake", {})
+    assert payload["short"] is True
+    assert payload["beyond_horizon"] is False
+    assert payload["exhausts_on"] == payload["window_end"]
+
+
+def test_the_panel_advertises_the_window_it_actually_measured(root: Path):
+    # ``window_days`` is a separate literal from the argument ``assess`` is called with, so
+    # the two can drift and the payload would keep claiming thirty days while measuring
+    # three. A narrowed window drops the busiest day and lengthens the runway.
+    payload = service_over(root).run_query("lake", {})
+    start = date.fromisoformat(payload["window_start"])
+    end = date.fromisoformat(payload["window_end"])
+    assert payload["window_days"] == 30
+    assert (end - start).days == payload["window_days"] - 1
+    assert all(start <= date.fromisoformat(day["day"]) <= end for day in payload["days"])
+
+
+def test_the_panel_advertises_the_headroom_threshold_it_flags_at(root: Path):
+    # The page prints this number to the reader, so it has to be the one the flag uses.
+    payload = service_over(root).run_query("lake", {})
+    assert payload["headroom_weeks"] == 3
+
+
+def test_a_reading_that_raises_reaches_the_reader_as_a_line(root: Path, monkeypatch):
+    # The backstop the query's docstring names. ``lake.runway`` contains both of its own
+    # readings, so this catches only a class neither expected, and the point of catching it
+    # is that a blank page says less than a named class does.
+    def boom(*args: object, **kwargs: object):
+        raise OSError("the device fell over")
+
+    monkeypatch.setattr(dashboard, "assess", boom)
+    payload = service_over(root).run_query("lake", {})
+    assert payload["error"] == "OSError"
+    assert payload["as_of"]
