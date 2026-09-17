@@ -747,10 +747,29 @@ def test_parsed_numbers_survives_null_repository_fields() -> None:
     assert parsed_numbers(refs, REPO) == frozenset({390})
 
 
+MALFORMED = [
+    ({"errors": ["nope"]}, "an error payload with no data at all"),
+    (
+        {"data": {"repository": {"i77": {"closedAt": "2020-01-01T00:00:00Z"}}}},
+        "an issue with no number",
+    ),
+    ({"data": {"repository": [1, 2]}}, "a repository that is a list"),
+    ({"data": {"repository": {"i77": "not an object"}}}, "an issue that is a string"),
+    ({"data": None}, "a null data block"),
+]
+
+
+@pytest.mark.parametrize("payload,why", MALFORMED, ids=[w for _, w in MALFORMED])
 def test_closed_before_survives_a_payload_it_does_not_recognise(
-    monkeypatch: pytest.MonkeyPatch,
+    payload: dict, why: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("tools.pr_links._gh", lambda args: json.dumps({"errors": ["nope"]}))
+    """Returning nothing leaves every claim in `missing`, which is the loud direction.
+
+    The first case alone did not reach the guard, because every `or {}` short-circuited and
+    the generator ran over an empty collection without raising. The four after it each raise
+    inside the generator, which is where the guard actually sits.
+    """
+    monkeypatch.setattr("tools.pr_links._gh", lambda args: json.dumps(payload))
     assert closed_before((77,), NOW, REPO) == frozenset()
 
 
@@ -768,7 +787,18 @@ def test_main_refuses_an_argument_that_is_not_a_number(
     assert "not a pull request number" in capsys.readouterr().err
 
 
-def test_main_refuses_a_repository_without_a_slash(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A bare name makes every qualified reference foreign and fails a correct body."""
+def test_main_refuses_a_repository_without_a_slash(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bare name makes every qualified reference foreign and fails a correct body.
+
+    `fetch` is stubbed with a body that would otherwise pass, so the guard is the only thing
+    that can return 2. Without the stub this passed for the wrong reason: the guard fell
+    through, the real `gh pr view --repo marketlake` failed, and `CouldNotRun` returned 2 by
+    another route. Mutation testing caught that, not review.
+    """
     monkeypatch.setenv("GITHUB_REPOSITORY", "marketlake")
+    monkeypatch.setattr("tools.pr_links.fetch", lambda pr, repo: ("Closes #390", [_ref(390)], NOW))
+    monkeypatch.setattr("tools.pr_links.publish", _Publish())
     assert main(["413"]) == 2
+    assert "usage:" in capsys.readouterr().out

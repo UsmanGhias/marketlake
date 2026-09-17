@@ -107,12 +107,19 @@ _REF = rf"(?:{_REPO}#|GH-|{_URL})(\d+)"
 _DECOR = r"(?:[`(*_]|\[[^\]\n#]{1,60}\]\(|\[)*+"
 """Leading decoration the house style puts in front of a reference.
 
-Possessive for the same reason as :data:`_GAP`, which means the two branches beginning with
-``[`` must not overlap. A titled link's label is required to hold no ``#``, so
-``[the issue](...)`` takes the link branch while ``[#390](...)`` and
-``[l3a0/marketlake#390](...)`` take the bare-bracket branch and let the reference itself
-match. Without that split, the link branch would swallow ``[#390](`` and a possessive star
-could not give it back.
+The two branches beginning with ``[`` must not overlap, and that is what keeps this linear.
+A titled link's label is required to hold no ``#``, so ``[the issue](...)`` takes the link
+branch while ``[#390](...)`` and ``[l3a0/marketlake#390](...)`` take the bare-bracket branch
+and let the reference itself match. Without that split, the link branch would swallow
+``[#390](`` and a possessive star could not give it back.
+
+The possessive quantifier is belt-and-braces rather than load-bearing, and it is worth being
+straight about which. Measured both ways at `d5cadf3`, a plain star is already linear here:
+5,000 brackets take 0.0023s against 0.0017s possessive. So no test distinguishes the two, and
+mutation testing reports this one surviving. It stays because the disjointness it depends on
+lives in a different expression, :data:`_URL` and the label class above, and a later edit
+widening either would reintroduce the overlap silently. :data:`_GAP` is the opposite case,
+where the quantifier is the whole defence.
 
 Backticks, brackets and emphasis, plus a markdown link whose label is words rather than the
 number, as in ``Closes [the issue](.../issues/390)``. GitHub parses that one and a scan
