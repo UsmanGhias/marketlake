@@ -1,9 +1,9 @@
 """Manifest logic decided from values alone.
 
-These cover the line parser, last-entry-wins, the torn-tail discard, the segment to
-compacted-partition mapping the supersession rule leans on, and the reverse-pass
-exclusion predicate. None of them touch a real lake. The disk-backed behaviors live in
-the component tier.
+These cover the line parser, last-entry-wins, the torn-tail discard, the count that
+decides whether a read left entries behind it, the segment to compacted-partition mapping
+the supersession rule leans on, and the reverse-pass exclusion predicate. None of them
+touch a real lake. The disk-backed behaviors live in the component tier.
 """
 
 from __future__ import annotations
@@ -16,9 +16,11 @@ import pytest
 from lake.manifest import (
     SCRUB_EXCLUSIONS,
     ManifestError,
+    TornLedger,
     _compacted_partition_for_segment,
     _is_excluded,
     _latest_by_partition,
+    _refuse_hidden_entries,
     is_quarantined,
     latest_entries,
     latest_quarantine,
@@ -59,6 +61,141 @@ def test_parse_discards_a_torn_trailing_line():
 
 def test_parse_of_empty_text_is_empty():
     assert parse_jsonl("") == []
+
+
+# -- the count that says the read left entries behind ------------------------
+
+_LEDGER = Path("/lake/quarantine.jsonl")
+
+
+def _line(partition: str) -> str:
+    return json.dumps({"partition": partition, "verdict": "clean", "check": "e"}) + "\n"
+
+
+def _refuses(text: str) -> TornLedger:
+    """The refusal ``_refuse_hidden_entries`` makes about ``text``, parsed the real way.
+
+    Handing it ``parse_jsonl``'s own output rather than a count written by hand is the
+    point. The two have to agree about where the read stopped, and a test that supplied
+    its own number would pass while they disagreed.
+    """
+    with pytest.raises(TornLedger) as refusal:
+        _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text))
+    return refusal.value
+
+
+def test_a_read_that_consumed_every_line_left_nothing_behind():
+    text = _line("a") + _line("b")
+    assert _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text)) is None
+
+
+def test_a_torn_tail_hides_nothing_and_is_not_refused():
+    text = _line("a") + '{"partition": "b", "verdict": "cle'
+    assert _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text)) is None
+
+
+def test_a_fusion_with_nothing_behind_it_is_the_cost_append_line_accepts():
+    """One entry lost and none hidden, which is the bound ``append_line`` states.
+
+    The fragment has no terminating newline, so the entry appended onto it becomes part of
+    the same line and no reader sees it. Refusing here would refuse the case the module
+    already decided to pay for. Nothing is hidden yet either: the very next append is what
+    puts a whole line behind the fused one, and from that read on this does refuse.
+    """
+    text = '{"partition": "a", "verd' + _line("b")
+    assert _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text)) is None
+    assert parse_jsonl(text) == []
+
+
+def test_one_entry_behind_the_fused_line_is_refused_and_counted():
+    text = '{"partition": "a", "verd' + _line("b") + _line("c")
+    message = str(_refuses(text))
+    assert "1 line after it is written and unreachable" in message
+    assert "the read stopped at line 1" in message
+    assert str(_LEDGER) in message
+    assert "human's job under the lock" in message
+    # The sentence that says what the count means. Without it the message names a line and a
+    # number and never says the verdicts behind them are the reason a read cannot be trusted.
+    assert (
+        "Every verdict behind that line is invisible, so this ledger cannot say which "
+        "partitions it withholds." in message
+    )
+
+
+def test_two_entries_behind_it_are_counted_and_read_as_plural():
+    """Three appends behind the fragment hide two, because the first fuses onto it."""
+    text = _line("a") + '{"partition": "b", "verd' + _line("c") + _line("d") + _line("e")
+    message = str(_refuses(text))
+    assert "2 lines after it are written and unreachable" in message
+    assert "the read stopped at line 2" in message
+
+
+def test_a_fragment_of_its_own_costs_no_entry_and_still_hides_what_follows():
+    """The other shape, where the partial write did end in a newline.
+
+    It is a line rather than a fusion, so it swallows no entry of its own. What follows it
+    is hidden exactly as it is behind a fusion, and is counted the same way.
+    """
+    text = '{"partition": "a", "verd\n' + _line("b")
+    assert "1 line after it is written and unreachable" in str(_refuses(text))
+
+
+def test_the_reported_line_is_the_one_an_editor_shows():
+    """The number's whole job is to send a person to the right line in the file.
+
+    Counting the parsed entries gives the stop's position among *non-blank* lines, and the
+    two diverge as soon as the file holds a blank one. No writer here makes a blank line, so
+    a file that has one has already been hand edited, which is exactly the file the person
+    this message addresses is looking at.
+    """
+    text = "\n\n\n" + '{"partition": "a", "verd' + _line("b") + _line("c")
+    assert "the read stopped at line 4" in str(_refuses(text))
+
+    between = _line("a") + "\n\n" + '{"partition": "b", "verd' + _line("c") + _line("d")
+    assert "the read stopped at line 4" in str(_refuses(between))
+
+
+def test_what_sits_behind_the_stop_is_counted_as_lines_not_entries():
+    """Damage does not have to be well formed, so the count says what it measured.
+
+    Every line behind the stop is unreachable whether or not it parses, and on a ledger a
+    writer produced they are verdicts. Calling them entries would be a claim this never
+    checked, in a message written for somebody deciding what to repair.
+    """
+    assert "1 line after it is written and unreachable" in str(_refuses("@@@\n$$$\n"))
+
+
+def test_blank_lines_are_not_counted_as_hidden_entries():
+    """A blank line is skipped by the parser, so counting it would refuse a clean ledger."""
+    text = _line("a") + "\n\n" + _line("b") + "\n\n"
+    assert _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text)) is None
+
+
+@pytest.mark.parametrize("filler", ["   ", "\t", " \t "])
+def test_a_whitespace_only_line_is_blank_to_both_sides_of_the_count(filler: str):
+    """The two sides have to agree on what a blank line is, or the guard inverts.
+
+    ``parse_jsonl`` strips a line before testing it, so a line of spaces or tabs is invisible
+    to the parse. A count that tested the raw line instead would see lines the parse never
+    consumed, read them as written entries hiding behind the stop, and refuse a ledger nothing
+    is wrong with. Every reader funnels through here, so that would lock ``load_chain``, the
+    battery, the dashboard and the sign-off tool out of a healthy lake.
+
+    An empty line cannot catch it, because it is falsy under both spellings. These have to be
+    lines that are truthy and blank, and they have to outnumber what parsed.
+    """
+    text = _line("a") + filler + "\n" + filler + "\n"
+    assert _refuse_hidden_entries(_LEDGER, text, parse_jsonl(text)) is None
+    assert _refuse_hidden_entries(_LEDGER, filler + "\n" + filler + "\n", []) is None
+
+
+def test_the_refusal_is_a_manifest_error():
+    """What puts it inside every ``except ManifestError`` already in the tree.
+
+    ``bars`` files a ticker-day unfit on one and ``loader`` publishes it as the error a
+    damaged ledger raises out of a read. A refusal outside that hierarchy would escape both.
+    """
+    assert issubclass(TornLedger, ManifestError)
 
 
 # -- last entry wins ---------------------------------------------------------

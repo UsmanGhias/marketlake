@@ -122,7 +122,7 @@ from lake.control_plane import (
     pmset_schedule_args,
     read_pmset_schedule,
 )
-from lake.manifest import is_quarantined, latest_quarantine
+from lake.manifest import ManifestError, is_quarantined, latest_quarantine
 from lake.paths import CHAINS, QUOTES
 from lake.report import (
     BARS_PIECE,
@@ -206,7 +206,30 @@ ScheduleSetter = Callable[[date], None]
 # its blast radius is the whole walk however it is caught, and for anything raised deeper a
 # refused piece is still strictly better than a lost evening. Containing the deeper ones where
 # they belong is marketlake #446.
-_LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable, OSError)
+# ``ManifestError`` as the class rather than one of its members, the lesson ``_BARS_REFUSALS``
+# below already writes down. Both walks read through ``lake.loader``, which resolves the
+# quarantine ledger on every partition it opens and publishes a damaged one as this error. Two
+# shapes reach here: a line that parses and names no partition, and ``manifest.TornLedger`` from
+# a read that stopped with verdicts written behind it. Executed against `8fb1fda`, the first
+# already took this whole run down, and with it the battery, the report file, the digest, the
+# ping and the Friday wake, on a lake whose only fault was one bad line in a ledger these walks
+# do not even write. Marketlake #469 made the second shape likely enough to matter, since a
+# crash mid-append needs no hand-malformed line.
+#
+# **This answers ``manifest._latest_by_partition``'s own sentence rather than ignoring it.**
+# That docstring says raising is safe because the two callers that must survive it already
+# catch it, and that "every other caller is a place where stopping is correct". These walks
+# are a third surviving caller, and the difference is what stopping costs here. There it is one
+# read that answers wrongly. Here it is every later step of the 18:30 job, none of which reads
+# a ledger at all. The walk still stops: it is refused, named in ``problems``, and it withholds
+# the ping, which is what the ``eod-sweep`` row already means by a missed ping. What it no
+# longer does is take the battery and the Friday wake down with it.
+#
+# **A damaged *manifest* ledger still stops this run, two steps later.** ``lake.bars`` resolves
+# it through ``manifest.latest_entries`` and ``_BARS_REFUSALS`` carries no ``ManifestError``,
+# so the claim above is redeemed for the quarantine ledger and not for the manifest.
+# Marketlake #447 owns the manifest ledger, and that sibling belongs to it rather than here.
+_LEDGER_REFUSALS = (MasterAbsent, MasterUnreadable, ManifestError, OSError)
 # ``CaptureSpansError`` as the class rather than one of its members, which is the lesson
 # ``bars.main`` already wrote down for itself: naming ``SpansUnreadable`` alone left its sibling
 # ``UnsupportedSpansSchemaVersion`` reaching the operator as a stack, and a spans file from a
@@ -293,6 +316,11 @@ def count_quarantined(lake_root: Path | str) -> int:
     job, so the number is this evening's rather than last evening's. A lake with no
     ``quarantine.jsonl`` reads as no entries, which is what keeps this from raising on a fresh
     lake.
+
+    A ledger whose read stops with verdicts written behind it does raise, as
+    ``manifest.TornLedger``, because a count taken from the entries in front of the damage
+    would read low and say nothing. :func:`_counted` contains it and reports the line, which
+    is the same containment every other count here already has.
 
     This is the whole ledger's open count rather than tonight's new findings. From the first
     verdict until a human signs it off, every night's file carries a standing non-zero number.
