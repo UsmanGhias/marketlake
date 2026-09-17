@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 
 import pytest
 from tools.pr_links import (
@@ -662,3 +663,89 @@ def test_main_refuses_without_a_pull_request_number(monkeypatch: pytest.MonkeyPa
 def test_parsed_numbers_matches_a_repository_in_another_case() -> None:
     """GitHub treats an owner and a repository name as case-insensitive."""
     assert parsed_numbers([_ref(390, "L3a0/Marketlake")], REPO) == frozenset({390})
+
+
+# ---------------------------------------------------------------------------
+# The scan must stay linear. Before the quantifiers were made possessive it was
+# cubic in a whitespace run, so a keyword followed by spaces and no reference
+# hung the job past its five-minute ceiling: a red check, no comment, and the
+# previous run's verdict left standing beside it. Anyone who can open a pull
+# request on a public repository can write that body and re-trigger it.
+# ---------------------------------------------------------------------------
+
+BLOWUP = [
+    ("Closes" + " " * 20000 + "and then prose.", "a long run of spaces reaching no reference"),
+    ("Closes" + "\t" * 20000 + "and then prose.", "tabs"),
+    ("Closes" + "[" * 5000 + " none", "a run of brackets"),
+    ("Closes" + "`(*_[" * 2000 + " none", "mixed decoration"),
+    ("Closes " + ":" * 5000 + " none", "colons"),
+    ("Part of" + " " * 20000 + "prose.", "the same shape on the Part of pattern"),
+]
+
+
+@pytest.mark.parametrize("body,why", BLOWUP, ids=[w for _, w in BLOWUP])
+def test_the_scan_stays_linear(body: str, why: str) -> None:
+    started = time.perf_counter()
+    assert scan(body, REPO).closes == frozenset()
+    assert time.perf_counter() - started < 1.0, why
+
+
+def test_a_qualified_reference_inside_a_markdown_link_still_reads() -> None:
+    """The link branch must not swallow a label that carries the reference itself."""
+    assert scan("Closes [l3a0/marketlake#390](u)", REPO).closes == frozenset({390})
+
+
+# ---------------------------------------------------------------------------
+# Payloads shaped unlike GitHub's schema must refuse rather than traceback. An
+# exception escaping `publish` skips the `broken` check in `main` entirely, so a
+# pull request whose link parsed correctly would still go red.
+# ---------------------------------------------------------------------------
+
+
+def test_a_comment_listing_that_is_not_a_list_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tools.pr_links._gh", lambda args: json.dumps({"message": "Not Found"}))
+    with pytest.raises(CouldNotRun, match="not shaped like comments"):
+        publish("verdict", 413, REPO, only_if_present=False)
+
+
+def test_a_comment_with_no_id_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    listing = [{"body": MARKER, "user": {"login": AUTHOR}}]
+    monkeypatch.setattr("tools.pr_links._gh", lambda args: json.dumps(listing))
+    with pytest.raises(CouldNotRun, match="not shaped like comments"):
+        publish("verdict", 413, REPO, only_if_present=False)
+
+
+def test_parsed_numbers_survives_null_repository_fields() -> None:
+    refs = [
+        {"number": 1, "repository": {"name": None, "owner": {"login": None}}},
+        {"repository": {"name": "marketlake", "owner": {"login": "l3a0"}}},
+        _ref(390),
+    ]
+    assert parsed_numbers(refs, REPO) == frozenset({390})
+
+
+def test_closed_before_survives_a_payload_it_does_not_recognise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("tools.pr_links._gh", lambda args: json.dumps({"errors": ["nope"]}))
+    assert closed_before((77,), NOW, REPO) == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# `main`'s own arguments.
+# ---------------------------------------------------------------------------
+
+
+def test_main_refuses_an_argument_that_is_not_a_number(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The workflow passes "$PR_NUMBER" quoted, so an empty value arrives as an empty string."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
+    assert main([""]) == 2
+    assert "not a pull request number" in capsys.readouterr().err
+
+
+def test_main_refuses_a_repository_without_a_slash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bare name makes every qualified reference foreign and fails a correct body."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "marketlake")
+    assert main(["413"]) == 2

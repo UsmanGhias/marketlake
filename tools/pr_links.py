@@ -57,8 +57,19 @@ MARKER = "<!-- pr-links-check -->"
 
 _KEYWORDS = r"close[sd]?|fix(?:e[sd])?|resolve[sd]?"
 
-_GAP = r"[ \t]*:?[ \t]*\r?\n?[ \t]*"
+_GAP = r"[ \t]*+:?+[ \t]*+(?:\r?\n)?+[ \t]*+"
 """What may sit between a keyword and its reference.
+
+**Every quantifier here is possessive, and that is load-bearing rather than tidy.** Three
+plain ``[ \t]*`` groups over one character class made the scan cubic in the length of a
+whitespace run, because the engine tries every way of splitting that run between them. A
+keyword followed by spaces and no ``#`` is all it takes, which anyone opening a pull request
+can write and re-trigger at will through the ``edited`` type. Measured before the fix: 400
+spaces took 0.86s, 800 took 6.8s and 1200 took 22.7s, so the job's five-minute ceiling
+arrives around 3,000 characters and a body may hold 65,536. A hang reaches none of the
+:class:`CouldNotRun` machinery either. It is a killed job, a red check, no comment, and
+whatever the last run said left standing beside it. Possessive quantifiers never give back
+what they matched, so a run that cannot reach a ``#`` fails at once.
 
 At most **one** line ending and never a blank line. Both halves are measured. Allowing one
 newline is what catches #364 and #372, whose keyword and number sit on adjacent lines.
@@ -93,8 +104,15 @@ with the alarm switched off. Adding this form introduced no new failure across t
 _REF = rf"(?:{_REPO}#|GH-|{_URL})(\d+)"
 """Every spelling of a reference: bare, ``owner/repo#NN``, ``GH-NN`` and a full issue URL."""
 
-_DECOR = r"(?:[`(*_]|\[[^\]\n]{0,60}\]\(|\[)*"
+_DECOR = r"(?:[`(*_]|\[[^\]\n#]{1,60}\]\(|\[)*+"
 """Leading decoration the house style puts in front of a reference.
+
+Possessive for the same reason as :data:`_GAP`, which means the two branches beginning with
+``[`` must not overlap. A titled link's label is required to hold no ``#``, so
+``[the issue](...)`` takes the link branch while ``[#390](...)`` and
+``[l3a0/marketlake#390](...)`` take the bare-bracket branch and let the reference itself
+match. Without that split, the link branch would swallow ``[#390](`` and a possessive star
+could not give it back.
 
 Backticks, brackets and emphasis, plus a markdown link whose label is words rather than the
 number, as in ``Closes [the issue](.../issues/390)``. GitHub parses that one and a scan
@@ -192,9 +210,12 @@ def parsed_numbers(references: list[dict], repo: str) -> frozenset[int]:
     here = set()
     for ref in references:
         holder = ref.get("repository") or {}
-        holder_owner = (holder.get("owner") or {}).get("login", "")
-        if holder_owner.lower() == owner.lower() and holder.get("name", "").lower() == name.lower():
-            here.add(int(ref["number"]))
+        holder_owner = (holder.get("owner") or {}).get("login") or ""
+        holder_name = holder.get("name") or ""
+        if holder_owner.lower() == owner.lower() and holder_name.lower() == name.lower():
+            number = ref.get("number")
+            if number is not None:
+                here.add(int(number))
     return frozenset(here)
 
 
@@ -351,12 +372,15 @@ def closed_before(numbers: tuple[int, ...], when: str, repo: str) -> frozenset[i
         payload = json.loads(_gh(["api", "graphql", "-f", f"query={query}"]))
     except (CouldNotRun, json.JSONDecodeError, KeyError, TypeError):
         return frozenset()
-    issues = ((payload.get("data") or {}).get("repository") or {}).values()
-    return frozenset(
-        issue["number"]
-        for issue in issues
-        if issue and issue.get("closedAt") and issue["closedAt"] < when
-    )
+    try:
+        issues = ((payload.get("data") or {}).get("repository") or {}).values()
+        return frozenset(
+            issue["number"]
+            for issue in issues
+            if issue and issue.get("closedAt") and issue["closedAt"] < when
+        )
+    except (AttributeError, KeyError, TypeError):
+        return frozenset()
 
 
 AUTHOR = "github-actions[bot]"
@@ -376,12 +400,15 @@ def _existing_comment(pr: int, repo: str) -> int | None:
         comments = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise CouldNotRun(f"comment listing is not JSON: {exc}") from exc
-    for comment in comments:
-        if MARKER not in (comment.get("body") or ""):
-            continue
-        if (comment.get("user") or {}).get("login") != AUTHOR:
-            continue
-        return int(comment["id"])
+    try:
+        for comment in comments:
+            if MARKER not in (comment.get("body") or ""):
+                continue
+            if (comment.get("user") or {}).get("login") != AUTHOR:
+                continue
+            return int(comment["id"])
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise CouldNotRun(f"the comment listing is not shaped like comments: {exc}") from exc
     return None
 
 
@@ -416,10 +443,14 @@ def publish(body: str, pr: int, repo: str, *, only_if_present: bool) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     repo = os.environ.get("GITHUB_REPOSITORY", "")
-    if not args or not repo:
+    if not args or "/" not in repo:
         print("usage: GITHUB_REPOSITORY=owner/name python -m tools.pr_links <pr-number>")
         return 2
-    pr = int(args[0])
+    try:
+        pr = int(args[0])
+    except ValueError:
+        print(f"not a pull request number: {args[0]!r}", file=sys.stderr)
+        return 2
 
     try:
         body, references, created_at = fetch(pr, repo)

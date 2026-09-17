@@ -17,8 +17,10 @@ permissions:
   contents: read
   pull-requests: write
 
-# `synchronize` and `edited` can fire within a second of each other. Two runs that both find
-# no comment of their own both create one.
+# `synchronize` and `edited` can fire within a second of each other, so this keeps one run per
+# pull request rather than a queue of them. It is not what stops a duplicate comment, because
+# cancellation is asynchronous and a run already inside the write finishes it. Re-reading the
+# comment list before every write is what stops that, in `tools.pr_links.publish`.
 concurrency:
   group: pr-links-${{ github.event.pull_request.number }}
   cancel-in-progress: true
