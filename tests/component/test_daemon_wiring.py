@@ -1304,6 +1304,9 @@ def test_a_roster_the_spans_emptied_leaves_the_dead_man_unfed_and_says_why(
     assert len(seen) == 3
     assert all(r.segments == () and r.out_of_span == ("XYZ",) for r in seen)
     assert rig.pinger.urls == []
+    # Three cycles is the watchdog's threshold, and still nothing but the dead-man pages
+    # this case (marketlake #570).
+    assert rig.transport.sent == []
     (line,) = _capture_lines(capsys.readouterr().err)
     assert line.startswith("capture: 2026-09-02T10:00:00-04:00: 1 enabled ticker(s)")
     assert "not captured: XYZ." in line
@@ -1339,6 +1342,68 @@ def test_the_line_names_a_partial_clamp_and_its_recovery_while_data_lands(
     assert named.startswith("capture: 2026-09-02T10:00:00-04:00: 1 enabled ticker(s)")
     assert "not captured: XYZ." in named
     assert recovered.startswith("capture: 2026-09-02T10:01:00-04:00: ")
+
+
+def test_a_partial_clamp_pages_the_tickers_the_spans_leave_out(tmp_path, monkeypatch):
+    """Through the real cycle runner, the case the dead-man cannot see (marketlake #570).
+
+    SPY lands data every minute, since the master does not name it and a ticker the master
+    cannot resolve is kept, so the dead-man is fed. XYZ is enabled and outside every span,
+    so it owes its minutes and nothing fetches it. Three cycles is the threshold.
+    """
+    rig = _rig(tmp_path, roster="SPY: {options: false}\nXYZ: {options: false}\n")
+    _xyz_span_closed(rig)
+    monkeypatch.setattr(capture, "SchwabVendor", _stub_schwab(_PlanVendor()))
+
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4)
+
+    assert rig.pinger.urls == [CAPTURE_URL] * 4
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.priority == PAGE_PRIORITY
+    assert page.title == "Capture down: tickers outside every capture span"
+    assert page.body == (
+        "1 enabled ticker(s) outside every capture span, the longest for 3 session minutes, "
+        "so not captured: XYZ. A retire, onboard or rejoin that stopped midway leaves this, "
+        "and so does a spans file that no longer matches the lake. The daemon log's capture: "
+        "lines name each change"
+    )
+
+
+@pytest.mark.parametrize(
+    ("left_out", "named"),
+    [
+        (("AAA", "BBB", "CCC", "DDD"), "AAA, BBB, CCC, DDD."),
+        (("AAA", "BBB", "CCC", "DDD", "EEE", "FFF"), "AAA, BBB, CCC, DDD and 2 more."),
+    ],
+)
+def test_the_out_of_span_page_names_four_tickers_and_counts_the_rest(tmp_path, left_out, named):
+    # A spans file restored from an old backup can leave out most of the roster at once,
+    # and the body has a byte budget. Exactly four names every one and counts nothing.
+    rig = _rig(tmp_path)
+    landed = SegmentOutcome(
+        surface=journal.QUOTES_SURFACE,
+        ticker="XYZ",
+        path=Path("seg.arrows"),
+        partition="p",
+        row_kind=journal.ROW_KIND_DATA,
+        rows=1,
+        error_class=None,
+        fetched_at=None,
+    )
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        return CycleResult(slot, (landed,), out_of_span=left_out)
+
+    clock = ManualClock(start=et(2026, 9, 2, 11, 58, 30))
+    _run(rig, clock, ticks=3, cycle_runner=runner)
+
+    (page,) = rig.transport.sent
+    assert page.body.startswith(
+        f"{len(left_out)} enabled ticker(s) outside every capture span, the longest for 3 "
+        f"session minutes, so not captured: {named} "
+    )
 
 
 def test_a_roster_whose_every_ticker_retired_still_feeds_the_dead_man(

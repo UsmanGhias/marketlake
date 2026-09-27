@@ -330,6 +330,36 @@ def _report(report: MarkingReport, pass_name: str) -> None:
     print(" ".join(parts), file=sys.stderr)
 
 
+# How many of the tickers the spans leave out the page names before it counts the rest.
+# The body has a byte budget, and a spans file restored from an old backup can leave out
+# most of the roster at once.
+_OUT_OF_SPAN_NAMED = 4
+
+
+def _out_of_span_body(page: Page) -> str:
+    """What the out-of-span page says: how many, for how long, and which.
+
+    It names up to ``_OUT_OF_SPAN_NAMED`` tickers and counts the rest. Unlike the folds
+    that fire only when a whole set failed, this set is part of the roster, so the names
+    say which part. Like the ``capture:`` line it names the possible causes and prescribes
+    no repair, because re-running ``retire`` or ``onboard`` is the wrong repair for some of
+    them. It carries no class, since nothing was attempted for these tickers, and no
+    dead-man follow-on, since the tickers still captured keep the dead-man fed.
+    """
+    names = ", ".join(page.tickers[:_OUT_OF_SPAN_NAMED])
+    rest = len(page.tickers) - _OUT_OF_SPAN_NAMED
+    if rest > 0:
+        names = f"{names} and {rest} more"
+    # The minutes are the longest any of them has been out, since the set folds tickers
+    # that left at different times. The log's line names every one, past the cap.
+    return (
+        f"{len(page.tickers)} enabled ticker(s) outside every capture span, the longest "
+        f"for {page.minutes} session minutes, so not captured: {names}. A retire, onboard "
+        "or rejoin that stopped midway leaves this, and so does a spans file that no "
+        "longer matches the lake. The daemon log's capture: lines name each change"
+    )
+
+
 class _OutOfSpanLine:
     """Say which enabled tickers the capture spans left out, when that changes.
 
@@ -348,6 +378,11 @@ class _OutOfSpanLine:
        sees the cycles in slot order, so a change is a change once.
     3. **It never raises.** ``run_loop`` wraps no hook, so a ``print`` that raises on a
        full log volume would end the daemon. A line that cannot be written is dropped.
+
+    When only some enabled tickers are left out, the watchdog pages them once they pass
+    its threshold, and that page names the same causes (marketlake #570). This line still
+    carries what the page cannot: every ticker past the page's cap of four, and when each
+    change happened.
 
     It prescribes no repair. The files cannot tell a retire that stopped midway, which
     owes nothing, from an onboard or a rejoin that stopped midway, or a spans file that
@@ -1345,6 +1380,13 @@ def run_loop_from_config(
 
     def raise_pages(pages: list[Page], now: datetime) -> None:
         for page in pages:
+            if page.tickers:
+                # The tickers the spans leave out, which have no surface and no class.
+                publisher.publish(
+                    Message(event="capture_down", title=page.title, body=_out_of_span_body(page)),
+                    now=now,
+                )
+                continue
             # The title says what went quiet. The class says why, and without it a rate
             # limit that starves one ticker reads as that ticker being dead. A page with
             # no class says nothing rather than guessing: a slept-through slot attempted
@@ -1420,7 +1462,10 @@ def run_loop_from_config(
         # Only the enabled entries are charged. A ticker disabled in place still names
         # an entry here, but its capture span is already closed, so charging it would
         # page for a surface nothing owes any more, the same reasoning gap-marking's
-        # roster read applies.
+        # roster read applies. An enabled entry the spans leave out is handed over too,
+        # and the watchdog leaves out the tickers the last cycle named as out of span,
+        # counting the slots toward their own page instead (marketlake #570). That set
+        # comes from the cycle, so this hook reads no spans.
         watched = [
             Surface(surface, entry.ticker)
             for entry in load_tickers(tickers_path).enabled
