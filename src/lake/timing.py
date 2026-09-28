@@ -1,4 +1,4 @@
-"""The request timing file: one line per vendor request, so a slow minute can be taken apart.
+"""The timing file: a line per vendor request and per cycle, so a slow minute can be taken apart.
 
 A capture cycle makes one request per chain window and one for the batched quotes, plus
 one for each half of a split window and a second attempt at a transient failure
@@ -8,7 +8,7 @@ window was slow or all nine were, or whether the time went to Schwab or to the n
 On 2026-09-24 three cycles ran past their minute and lost four slots, and nothing the lake
 held could say which. Marketlake #531 is that gap, and this file is where its evidence lands.
 
-Each line is one JSON object naming one request. It carries the request's own
+Most lines name one request. A request line is one JSON object carrying the request's own
 coordinates, which are the keys that join it to the rows it produced: ``snap_ts``,
 ``surface``, ``ticker``, and the ``window_start`` and ``window_end`` it asked for. It
 carries what capture made of the reply, ``status`` and ``error_class``, and six instants.
@@ -33,6 +33,31 @@ when nothing did, so a reader can tell a stamp nobody observed from one that fai
 line carries ``v``, the line format's version, because nothing like ``schema_version``
 covers a JSON file, and ``kind``, which is ``request`` here.
 
+A capture cycle adds one more line, ``kind`` ``cycle``, after its request lines
+(marketlake #537). The request lines end at the last response, and this one says where the
+rest of the cycle went. It carries the cycle's ``snap_ts`` and six instants.
+
+1. ``cycle_start_ts`` is when the cycle started, the instant its segment stamp uses.
+2. ``fetch_end_ts`` is the latest ``fetch_end_ts`` among the units the cycle planned, a
+   chain or the quote batch. A unit's spans its retry. On the concurrent path a unit the
+   bound cut ends at the bound. Null when the cycle planned nothing.
+3. ``segments_durable_ts`` is when the last unit had landed. Earlier units land inside
+   the fetch, so the tail after the fetch is this less ``fetch_end_ts``.
+4. ``lock_acquired_ts`` is when the cycle got the lake-root lock for its manifest append.
+   From durable to acquired is the wait, on another process or another cycle.
+5. ``lock_released_ts`` is when it let the lock go. From acquired to released is the hold.
+6. ``cycle_end_ts`` is read after the metadata stamp and the request lines, just before
+   this line is appended. The loop's hooks run later, on the loop thread, and are not in it.
+
+``loadavg_start`` and ``loadavg_end`` are ``os.getloadavg()`` read at the cycle's start
+and end, the 1, 5 and 15 minute averages. Concurrent fetching removed the gap between one
+chain's end and the next one's start that used to show the host's CPU at work, and the
+load says whether the host was busy around the cycle, not within any one second. A load
+read that fails is null, and ``cycle_failure`` names it, null when every field was read.
+Both kinds carry the same ``v``, so a reader filters on ``kind``. Cycles overlap, so one
+cycle's lines can sit between another's, and a reader groups them by ``snap_ts``, never
+by position.
+
 The file is ``journal/timing/date=YYYY-MM-DD.jsonl`` under the lake root. The journal
 tree is the right home for four reasons that were already true of it.
 
@@ -44,7 +69,8 @@ tree is the right home for four reasons that were already true of it.
    long (marketlake #538).
 
 Two rules keep the file from ever costing a minute. Every writer appends its lines only
-after its segments are durable and its manifest entries are appended. And each line is one
+after its segments are durable and its manifest entries are appended. So a cycle that
+raises at its manifest append writes neither kind of line. And each line is one
 ``O_APPEND`` write through ``manifest.append_line``, the same primitive the ledgers use,
 so onboarding, which fetches from its own process, can append to the same file without
 interleaving. A reader discards a torn trailing line, as the ledger readers do.
@@ -52,6 +78,7 @@ interleaving. A reader discards a torn trailing line, as the ledger readers do.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -66,6 +93,9 @@ TIMING_FORMAT_VERSION = 1
 
 # The ``kind`` of a line naming one vendor request.
 REQUEST_KIND = "request"
+
+# The ``kind`` of the line a capture cycle appends after its request lines.
+CYCLE_KIND = "cycle"
 
 
 @dataclass(frozen=True)
@@ -155,6 +185,74 @@ def append_requests(
     return path
 
 
+# A load reading: the 1, 5 and 15 minute averages ``os.getloadavg`` returns.
+Load = tuple[float, float, float]
+
+
+def read_load() -> tuple[Load | None, str | None]:
+    """The host's load average, or ``None`` and why it could not be read. Never raises.
+
+    ``os.getloadavg`` raises ``OSError`` when the load is unobtainable, and a cycle reads it
+    before its first request, where a raise would leave the cycle with nothing captured.
+    So a failure costs the reading and is named rather than raised.
+    """
+    try:
+        return os.getloadavg(), None
+    except Exception as exc:  # noqa: BLE001 - a load reading must never cost a minute
+        return None, f"load average not read: {type(exc).__name__}: {exc}"
+
+
+@dataclass(frozen=True)
+class CycleRecord:
+    """Where one capture cycle's time went, as the cycle itself saw it.
+
+    The module docstring defines each instant. ``fetch_end`` is ``None`` when the cycle
+    planned nothing. ``load_start`` and ``load_end`` are ``None`` when the reading failed,
+    and ``failures`` names why, in the order they happened.
+    """
+
+    snap_ts: datetime
+    cycle_start: datetime
+    fetch_end: datetime | None
+    segments_durable: datetime
+    lock_acquired: datetime
+    lock_released: datetime
+    cycle_end: datetime
+    load_start: Load | None
+    load_end: Load | None
+    failures: tuple[str, ...] = ()
+
+    def line(self) -> dict[str, object]:
+        """This cycle as one line of the timing file."""
+        return {
+            "v": TIMING_FORMAT_VERSION,
+            "kind": CYCLE_KIND,
+            "snap_ts": self.snap_ts.isoformat(),
+            "cycle_start_ts": self.cycle_start.isoformat(),
+            "fetch_end_ts": _iso(self.fetch_end),
+            "segments_durable_ts": self.segments_durable.isoformat(),
+            "lock_acquired_ts": self.lock_acquired.isoformat(),
+            "lock_released_ts": self.lock_released.isoformat(),
+            "cycle_end_ts": self.cycle_end.isoformat(),
+            "loadavg_start": None if self.load_start is None else list(self.load_start),
+            "loadavg_end": None if self.load_end is None else list(self.load_end),
+            "cycle_failure": "; ".join(self.failures) or None,
+        }
+
+
+def append_cycle(lake_root: Path | str, *, day: date, record: CycleRecord) -> Path:
+    """Append one cycle's line to ``day``'s timing file, and return the file's path.
+
+    ``day`` is the date the cycle's segments file under, as for ``append_requests``. The
+    line is one ``O_APPEND`` write, so two cycles appending at once each land a whole line.
+    This raises what the filesystem raises, and capture decides what a failure costs.
+    """
+    path = timing_path(lake_root, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    append_line(path, record.line())
+    return path
+
+
 def reasons(record: RequestRecord) -> list[str]:
     """Why one record came out incomplete: its own failure, then its timing's, if any."""
     found = [record.failure, record.timing.failure if record.timing else None]
@@ -172,11 +270,15 @@ def failures(records: Sequence[RequestRecord]) -> list[str]:
 
 
 __all__ = [
+    "CYCLE_KIND",
     "REQUEST_KIND",
     "TIMING_FORMAT_VERSION",
+    "CycleRecord",
     "RequestRecord",
+    "append_cycle",
     "append_requests",
     "failures",
+    "read_load",
     "reasons",
     "timing_path",
 ]
