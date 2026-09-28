@@ -16,9 +16,10 @@ What one run does, in the design's own order.
    is the calendar's answer and not the manifest's. Marketlake #431.
 2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
    walk covers every session the capture spans still hold unlanded rather than only
-   the one the clock is in, because a daily bar has no close of record to pass that
-   check against on the night of its own session. Marketlake #422, with marketlake
-   #434 turning that night's fetch into a skip.
+   the one the clock is in, because a daily bar waits for the next session to seal before
+   it is fetched, and on the night of its own session that has not happened. Marketlake
+   #422, with marketlake #434 turning that night's fetch into a skip and marketlake #618
+   moving the check onto the session's own 16:15 quote.
 3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
    partitions and writes a quarantine verdict for what fails. The design places it between the
    bar fetch and the Friday branch, which is where this list puts it.
@@ -123,7 +124,7 @@ from lake.control_plane import (
     pmset_schedule_args,
     read_pmset_schedule,
 )
-from lake.loader import NoSpotClose
+from lake.loader import SnapAbsent
 from lake.manifest import ManifestError, is_quarantined, latest_quarantine
 from lake.paths import CHAINS, QUOTES
 from lake.report import (
@@ -352,7 +353,12 @@ _BARS_REFUSALS = (
 # rebuild". The other three want a human. ``PartitionAbsent`` is a manifested partition gone
 # from disk, which wants a restore, ``PartitionQuarantined`` a sign-off, and ``PartialRead`` a
 # schema change (marketlake #530).
-_PERMANENT_ABANDON_REASONS = frozenset({NoSpotClose.__name__, CLOSE_VALUE_ABSENT})
+#
+# ``SnapAbsent`` took ``NoSpotClose``'s place when marketlake #618 moved the gate's reference
+# onto the session's own 16:15 row, read by minute. A gap row at that minute is the same
+# permanent absence the old read met at 16:00, and the live lake's six abandoned ticker-days
+# carry it. Without it here the census line would turn to ``ACTION`` on the first night.
+_PERMANENT_ABANDON_REASONS = frozenset({SnapAbsent.__name__, CLOSE_VALUE_ABSENT})
 
 
 def set_sunday_wake(sunday: date) -> None:
@@ -856,8 +862,9 @@ def sweep(
                 pieces.append((name, _refused(exc)))
         if closed:
             # **The walk is the backfill, not a single session, and marketlake #422 is why.**
-            # A daily bar is judged against the calendar-next session's settled close, which at
-            # 18:30 on session S has not been captured. The single-session fetch said that
+            # A daily bar is fetched only once the calendar-next session has sealed, which at
+            # 18:30 on session S it has not. Until marketlake #618 that session was also what
+            # the bar was judged against. The single-session fetch said that
             # settled itself because the next run would land the bar, and it did not: the next
             # run fetched the *next* session and met the same absence for it, and nothing
             # scheduled ever came back. So the nightly job landed no daily bar at all, and this
@@ -866,8 +873,9 @@ def sweep(
             # **What that night's ticker-day does about it changed under marketlake #434.** It
             # used to be fetched, gated against a close nobody had captured, and held, which
             # spent a vendor request and filed a withheld file on a gate that could not pass.
-            # The close of record is this lake's rather than the vendor's, so the walk reads it
-            # first and reports the ticker-day under ``unsettled`` instead. The recovery above
+            # Whether the next session has sealed is this lake's to answer rather than the
+            # vendor's, so the walk asks it first and reports the ticker-day under ``unsettled``
+            # instead. The recovery above
             # is untouched, which is what makes the skip safe: a session skipped tonight is a
             # session tomorrow's run still walks.
             #
@@ -875,7 +883,7 @@ def sweep(
             # subsumes the single-session fetch rather than running beside it: ``_span_sessions``
             # puts a session in range once its equity close has arrived, so at 18:30 today is in
             # range along with every earlier session still unlanded. Yesterday's held daily bar
-            # is reached with its following quotes now sealed.
+            # is reached with its following session now sealed.
             #
             # **Its cost is bounded rather than reasoned about, which is marketlake #478.** This
             # comment used to argue the walk was safe because a run at the 1-minute lookback
@@ -994,9 +1002,10 @@ def sweep(
                 # ``report.redacted``, which is the other half of why it counts classes rather
                 # than naming an entry.
                 #
-                # **``unsettled`` is deliberately not reported here.** It is a ticker-day whose
-                # close of record the lake has not sealed yet, which on a healthy run is the
-                # newest session and nothing else, right every night by construction. A line
+                # **``unsettled`` is deliberately not reported here.** It is a ticker-day that
+                # cannot be judged yet, because the next session has not sealed or its own has
+                # not. On a healthy run that is the newest session and nothing else, waiting for
+                # the next one, right every night by construction. A line
                 # that is loud every evening is one the reader learns to skip, which is the
                 # argument ``dashboard._ping_owed`` already makes in those words. It still
                 # reaches the by-hand run's own output, which is where a reader who wants it
